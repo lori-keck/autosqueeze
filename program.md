@@ -36,34 +36,36 @@ For each experiment:
 
 ## Research Directions to Explore
 
-These are suggestions, not requirements. Try whatever you think might work.
+Read RESEARCH.md for detailed background on each technique. These are ordered by expected impact.
 
-### Tier 1 — Foundation (start here)
-- LZ77/LZ78 — sliding window, dictionary-based compression
-- Huffman coding — variable-length codes based on byte frequency
-- Combine LZ + Huffman (this is basically what gzip/deflate does)
+### Phase 1 — Foundation (START HERE)
+- **LZ77** — sliding window, find repeated byte sequences, encode as (offset, length) pairs. This alone should drop ratio from 1.9 to ~0.5-0.7. This is the basis of gzip, zstd, and most modern compressors.
+- Keep the implementation clean and correct. Speed doesn't matter yet.
 
-### Tier 2 — Advanced
-- LZW (Lempel-Ziv-Welch) — dictionary that grows during compression
-- Arithmetic coding — more efficient than Huffman for skewed distributions
-- BWT (Burrows-Wheeler Transform) — reorders data to be more compressible, then use RLE/Huffman
-- ANS (Asymmetric Numeral Systems) — modern entropy coding, faster than arithmetic coding
-- Context mixing — predict next byte using multiple models, weight them
+### Phase 2 — Entropy Coding
+- **Huffman coding** on top of LZ77 output — frequent symbols get short codes, rare ones get long codes.
+- This is what gzip/deflate does (LZ77 + Huffman). Expected: another 10-20% improvement.
+- Later: consider replacing Huffman with **ANS/FSE** (Asymmetric Numeral Systems) — faster and slightly better ratios. This is what zstd uses.
 
-### Tier 3 — Novel / Experimental
-- Hybrid approaches — combine multiple techniques adaptively based on data characteristics
-- Block-level algorithm selection — analyze each block and pick the best algorithm for it
-- Novel dictionary construction — what if you build the dictionary differently?
-- Bit-level operations — work at the bit level instead of byte level
-- Recursive compression — compress, then try to compress the compressed output
-- Pattern detection — find and encode repeating patterns beyond simple byte sequences
-- Delta encoding + compression — for structured/sequential data
+### Phase 3 — Transforms
+- **BWT (Burrows-Wheeler Transform)** — reorders data so similar bytes cluster together, then simpler algorithms work better. bzip2 uses this.
+- **Move-to-front transform** — after BWT, recently-seen bytes get small codes
+- **Delta encoding** — store differences between consecutive values (great for structured data like CSV)
 
-### Tier 4 — Wild Ideas
-- What if you used multiple passes?
-- What if you preprocessed the data with a reversible transform before compressing?
-- What if you split the data into channels (like separating RGB in an image) and compressed each differently?
-- What if you used something nobody has tried before?
+### Phase 4 — Advanced
+- **Block-level algorithm selection** — analyze each block's characteristics and pick the best algorithm for it (some blocks are text, some are binary, some are random)
+- **Adaptive dictionary** — build and maintain a dictionary during compression
+- **Context modeling** — predict the next byte using the bytes you've already seen. The better your prediction, the less information you need to encode.
+
+### Phase 5 — Novel / Experimental
+- **Simplified context mixing** — multiple prediction models weighted together. This is what the Hutter Prize winners use (cmix/PAQ). Even a basic version could be interesting.
+- **Multi-pass compression** — compress, analyze the output, compress again with different parameters
+- **Byte-level pattern mining** — find repeating patterns beyond what LZ77's sliding window catches
+- **Hybrid approaches** — what if you tried something nobody has tried before?
+- **Channel separation** — split data by byte position or characteristics, compress each stream differently
+
+### Key Insight
+Compression IS prediction. If you can predict the next byte with 100% accuracy, the compressed size is zero. Every improvement in prediction = improvement in compression. The best compressors (cmix) are essentially language models.
 
 ## What Success Looks Like
 
