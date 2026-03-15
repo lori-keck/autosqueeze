@@ -11,7 +11,7 @@
 
 use std::io::{self, Read, Write};
 
-const WINDOW_SIZE: usize = 32768;
+const WINDOW_SIZE: usize = 262144;
 const MIN_MATCH: usize = 3;
 const MAX_MATCH: usize = 258;
 const HASH_CHAIN_LIMIT: usize = 128;
@@ -92,7 +92,13 @@ fn offset_to_code(offset: usize) -> (u8, u8, u16) {
         12289..=16384 => (27, 12, (offset - 12289) as u16),
         16385..=24576 => (28, 13, (offset - 16385) as u16),
         24577..=32768 => (29, 13, (offset - 24577) as u16),
-        _ => (29, 13, 0),
+        32769..=49152 => (30, 14, (offset - 32769) as u16),
+        49153..=65536 => (31, 14, (offset - 49153) as u16),
+        65537..=98304 => (32, 15, (offset - 65537) as u16),
+        98305..=131072 => (33, 15, (offset - 98305) as u16),
+        131073..=196608 => (34, 16, (offset - 131073) as u16),
+        196609..=262144 => (35, 16, (offset - 196609) as u16),
+        _ => (35, 16, 0),
     }
 }
 
@@ -106,6 +112,9 @@ fn code_to_offset_base(code: u8) -> (usize, u8) {
         20 => (1025, 9), 21 => (1537, 9), 22 => (2049, 10), 23 => (3073, 10),
         24 => (4097, 11), 25 => (6145, 11), 26 => (8193, 12), 27 => (12289, 12),
         28 => (16385, 13), 29 => (24577, 13),
+        30 => (32769, 14), 31 => (49153, 14),
+        32 => (65537, 15), 33 => (98305, 15),
+        34 => (131073, 16), 35 => (196609, 16),
         _ => (0, 0),
     }
 }
@@ -372,7 +381,7 @@ fn decode_sym(reader: &mut BitReader, sym_table: &[u16], len_table: &[u8], max_b
 
 fn estimate_block_size(tokens: &[Token], transform_literals: bool) -> usize {
     let mut ll_freq = vec![0u32; 286];
-    let mut d_freq = vec![0u32; 30];
+    let mut d_freq = vec![0u32; 36];
     let mut prev_lit = 0u8;
     for t in tokens {
         match t {
@@ -416,7 +425,7 @@ fn encode_block(tokens: &[Token], out: &mut Vec<u8>) {
     out.push(if use_delta { 1 } else { 0 });
 
     let mut ll_freq = vec![0u32; 286];
-    let mut d_freq = vec![0u32; 30];
+    let mut d_freq = vec![0u32; 36];
     let mut prev_lit = 0u8;
     for t in tokens {
         match t {
@@ -508,7 +517,7 @@ pub fn decompress(input: &[u8]) -> Vec<u8> {
         if pos >= input.len() { break; }
         let d_count = input[pos] as usize; pos += 1;
         if pos + d_count > input.len() { break; }
-        let mut d_lens = vec![0u8; 30];
+        let mut d_lens = vec![0u8; 36];
         d_lens[..d_count].copy_from_slice(&input[pos..pos + d_count]); pos += d_count;
 
         if pos + 4 > input.len() { break; }
