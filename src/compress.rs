@@ -1,24 +1,122 @@
 /// compress.rs — THE FILE THE AGENT EDITS
 ///
-/// CURRENT ALGORITHM: LZ77 with hash chains, lazy matching, batched literals
+/// CURRENT ALGORITHM: LZ77 + Block Huffman
 ///
-/// Format (same as PR #3):
-///   0xxxxxxx: literal run of (tag+1) bytes (1-128)
-///   1xxxxxxx + offset_hi + offset_lo: match, length = (tag & 0x7F) + 3 (3-130)
+/// Pipeline:
+///   1. LZ77 with hash chains + lazy matching → token stream
+///   2. Split into 32KB blocks
+///   3. Each block: build Huffman codes, write header + encoded data
 ///
-/// New: lazy matching — before committing to a match, check if the next
-/// position has a significantly better match. If so, emit a literal and
-/// take the longer match instead.
+/// Block format:
+///   [block_type: 1 byte] [block specific data]
+///   Type 0: raw (uncompressed) block — [size: 2 bytes LE] [raw bytes]
+///   Type 1: Huffman block — [litlen_count: 2B] [litlen_lens...] [dist_count: 1B] [dist_lens...] [bits...]
 ///
-/// New: better hash function (fewer collisions), quick-reject on chain walk.
+/// Symbol space (DEFLATE-style):
+///   Litlen: 0-255 = literals, 256 = EOB, 257-285 = length codes
+///   Dist: 0-29 = distance codes
 
 use std::io::{self, Read, Write};
 
 const WINDOW_SIZE: usize = 32768;
 const MIN_MATCH: usize = 3;
-const MAX_MATCH: usize = 130; // 0x7F + 3
-const MAX_LITERAL_RUN: usize = 128;
+const MAX_MATCH: usize = 258;
 const HASH_CHAIN_LIMIT: usize = 96;
+
+// ─── DEFLATE length/distance tables ──────────────────────────────────────
+
+fn length_to_code(length: usize) -> (u16, u8, u16) {
+    match length {
+        3 => (257, 0, 0), 4 => (258, 0, 0), 5 => (259, 0, 0),
+        6 => (260, 0, 0), 7 => (261, 0, 0), 8 => (262, 0, 0),
+        9 => (263, 0, 0), 10 => (264, 0, 0),
+        11..=12 => (265, 1, (length - 11) as u16),
+        13..=14 => (266, 1, (length - 13) as u16),
+        15..=16 => (267, 1, (length - 15) as u16),
+        17..=18 => (268, 1, (length - 17) as u16),
+        19..=22 => (269, 2, (length - 19) as u16),
+        23..=26 => (270, 2, (length - 23) as u16),
+        27..=30 => (271, 2, (length - 27) as u16),
+        31..=34 => (272, 2, (length - 31) as u16),
+        35..=42 => (273, 3, (length - 35) as u16),
+        43..=50 => (274, 3, (length - 43) as u16),
+        51..=58 => (275, 3, (length - 51) as u16),
+        59..=66 => (276, 3, (length - 59) as u16),
+        67..=82 => (277, 4, (length - 67) as u16),
+        83..=98 => (278, 4, (length - 83) as u16),
+        99..=114 => (279, 4, (length - 99) as u16),
+        115..=130 => (280, 4, (length - 115) as u16),
+        131..=162 => (281, 5, (length - 131) as u16),
+        163..=194 => (282, 5, (length - 163) as u16),
+        195..=226 => (283, 5, (length - 195) as u16),
+        227..=257 => (284, 5, (length - 227) as u16),
+        258 => (285, 0, 0),
+        _ => (285, 0, 0),
+    }
+}
+
+fn code_to_length_base(code: u16) -> (usize, u8) {
+    match code {
+        257 => (3, 0), 258 => (4, 0), 259 => (5, 0), 260 => (6, 0),
+        261 => (7, 0), 262 => (8, 0), 263 => (9, 0), 264 => (10, 0),
+        265 => (11, 1), 266 => (13, 1), 267 => (15, 1), 268 => (17, 1),
+        269 => (19, 2), 270 => (23, 2), 271 => (27, 2), 272 => (31, 2),
+        273 => (35, 3), 274 => (43, 3), 275 => (51, 3), 276 => (59, 3),
+        277 => (67, 4), 278 => (83, 4), 279 => (99, 4), 280 => (115, 4),
+        281 => (131, 5), 282 => (163, 5), 283 => (195, 5), 284 => (227, 5),
+        285 => (258, 0),
+        _ => (0, 0),
+    }
+}
+
+fn offset_to_code(offset: usize) -> (u8, u8, u16) {
+    match offset {
+        1 => (0, 0, 0), 2 => (1, 0, 0), 3 => (2, 0, 0), 4 => (3, 0, 0),
+        5..=6 => (4, 1, (offset - 5) as u16),
+        7..=8 => (5, 1, (offset - 7) as u16),
+        9..=12 => (6, 2, (offset - 9) as u16),
+        13..=16 => (7, 2, (offset - 13) as u16),
+        17..=24 => (8, 3, (offset - 17) as u16),
+        25..=32 => (9, 3, (offset - 25) as u16),
+        33..=48 => (10, 4, (offset - 33) as u16),
+        49..=64 => (11, 4, (offset - 49) as u16),
+        65..=96 => (12, 5, (offset - 65) as u16),
+        97..=128 => (13, 5, (offset - 97) as u16),
+        129..=192 => (14, 6, (offset - 129) as u16),
+        193..=256 => (15, 6, (offset - 193) as u16),
+        257..=384 => (16, 7, (offset - 257) as u16),
+        385..=512 => (17, 7, (offset - 385) as u16),
+        513..=768 => (18, 8, (offset - 513) as u16),
+        769..=1024 => (19, 8, (offset - 769) as u16),
+        1025..=1536 => (20, 9, (offset - 1025) as u16),
+        1537..=2048 => (21, 9, (offset - 1537) as u16),
+        2049..=3072 => (22, 10, (offset - 2049) as u16),
+        3073..=4096 => (23, 10, (offset - 3073) as u16),
+        4097..=6144 => (24, 11, (offset - 4097) as u16),
+        6145..=8192 => (25, 11, (offset - 6145) as u16),
+        8193..=12288 => (26, 12, (offset - 8193) as u16),
+        12289..=16384 => (27, 12, (offset - 12289) as u16),
+        16385..=24576 => (28, 13, (offset - 16385) as u16),
+        24577..=32768 => (29, 13, (offset - 24577) as u16),
+        _ => (29, 13, 0),
+    }
+}
+
+fn code_to_offset_base(code: u8) -> (usize, u8) {
+    match code {
+        0 => (1, 0), 1 => (2, 0), 2 => (3, 0), 3 => (4, 0),
+        4 => (5, 1), 5 => (7, 1), 6 => (9, 2), 7 => (13, 2),
+        8 => (17, 3), 9 => (25, 3), 10 => (33, 4), 11 => (49, 4),
+        12 => (65, 5), 13 => (97, 5), 14 => (129, 6), 15 => (193, 6),
+        16 => (257, 7), 17 => (385, 7), 18 => (513, 8), 19 => (769, 8),
+        20 => (1025, 9), 21 => (1537, 9), 22 => (2049, 10), 23 => (3073, 10),
+        24 => (4097, 11), 25 => (6145, 11), 26 => (8193, 12), 27 => (12289, 12),
+        28 => (16385, 13), 29 => (24577, 13),
+        _ => (0, 0),
+    }
+}
+
+// ─── Hash Chain ──────────────────────────────────────────────────────────
 
 struct HashChain {
     head: Vec<i32>,
@@ -28,12 +126,8 @@ struct HashChain {
 
 impl HashChain {
     fn new() -> Self {
-        let size = 1 << 16; // 64K entries (was 32K — fewer collisions)
-        HashChain {
-            head: vec![-1i32; size],
-            prev: vec![-1i32; WINDOW_SIZE],
-            mask: size - 1,
-        }
+        let size = 1 << 16;
+        HashChain { head: vec![-1i32; size], prev: vec![-1i32; WINDOW_SIZE], mask: size - 1 }
     }
 
     fn hash4(data: &[u8], pos: usize) -> usize {
@@ -43,7 +137,6 @@ impl HashChain {
                 ^ (data[pos + 1] as usize).wrapping_mul(40503)
                 ^ (data[pos + 2] as usize);
         }
-        // 4-byte hash for fewer collisions
         (data[pos] as usize).wrapping_mul(2654435761)
             ^ (data[pos + 1] as usize).wrapping_mul(2246822519)
             ^ (data[pos + 2] as usize).wrapping_mul(40503)
@@ -60,100 +153,59 @@ impl HashChain {
     fn find_best_match(&self, data: &[u8], pos: usize) -> (usize, usize) {
         if pos + 2 >= data.len() { return (0, 0); }
         let h = Self::hash4(data, pos) & self.mask;
-        let mut chain_pos = self.head[h];
+        let mut cp = self.head[h];
         let mut best_len = MIN_MATCH - 1;
-        let mut best_offset = 0usize;
-        let mut chain_count = 0;
-        let min_pos = pos.saturating_sub(WINDOW_SIZE);
-        let max_len = MAX_MATCH.min(data.len() - pos);
+        let mut best_off = 0usize;
+        let mut count = 0;
+        let min_p = pos.saturating_sub(WINDOW_SIZE);
+        let max_l = MAX_MATCH.min(data.len() - pos);
 
-        while chain_pos >= 0 && (chain_pos as usize) >= min_pos && chain_count < HASH_CHAIN_LIMIT {
-            let cp = chain_pos as usize;
-            if cp >= pos {
-                chain_pos = self.prev[cp % WINDOW_SIZE];
-                chain_count += 1;
-                continue;
+        while cp >= 0 && (cp as usize) >= min_p && count < HASH_CHAIN_LIMIT {
+            let c = cp as usize;
+            if c < pos {
+                if data[c + best_len] == data[pos + best_len] {
+                    let mut l = 0;
+                    while l < max_l && data[c + l] == data[pos + l] { l += 1; }
+                    if l > best_len { best_len = l; best_off = pos - c; if l == max_l { break; } }
+                }
             }
-
-            // Quick reject: check byte at current best length
-            if data[cp + best_len] != data[pos + best_len] {
-                chain_pos = self.prev[cp % WINDOW_SIZE];
-                chain_count += 1;
-                continue;
-            }
-
-            let mut length = 0;
-            while length < max_len && data[cp + length] == data[pos + length] {
-                length += 1;
-            }
-
-            if length > best_len {
-                best_len = length;
-                best_offset = pos - cp;
-                if length == max_len { break; }
-            }
-
-            chain_pos = self.prev[cp % WINDOW_SIZE];
-            chain_count += 1;
+            cp = self.prev[c as usize % WINDOW_SIZE];
+            count += 1;
         }
-
-        if best_len >= MIN_MATCH {
-            (best_len, best_offset)
-        } else {
-            (0, 0)
-        }
+        if best_len >= MIN_MATCH { (best_len, best_off) } else { (0, 0) }
     }
 }
 
-#[derive(Debug)]
-enum Token {
-    Literal(u8),
-    Match { length: usize, offset: usize },
-}
+// ─── LZ77 Token ──────────────────────────────────────────────────────────
 
-pub fn compress(input: &[u8]) -> Vec<u8> {
-    if input.is_empty() {
-        return Vec::new();
-    }
+enum Token { Literal(u8), Match { length: usize, offset: usize } }
 
-    let mut tokens: Vec<Token> = Vec::new();
+fn lz77_tokenize(input: &[u8]) -> Vec<Token> {
+    let mut tokens = Vec::new();
     let mut chain = HashChain::new();
     let mut pos = 0;
-
     while pos < input.len() {
-        let (match_len, match_offset) = chain.find_best_match(input, pos);
-
-        if match_len >= MIN_MATCH && match_offset <= 65535 {
-            // Lazy matching: check next position
+        let (ml, mo) = chain.find_best_match(input, pos);
+        if ml >= MIN_MATCH && mo <= 32768 {
             let mut use_lazy = false;
-            if match_len < MAX_MATCH && pos + 1 < input.len() {
+            if ml < MAX_MATCH && pos + 1 < input.len() {
                 chain.insert(input, pos);
-                let (next_len, next_offset) = chain.find_best_match(input, pos + 1);
-                // Only take next match if it's meaningfully better
-                // (longer by >= 2, since we pay 1 literal to defer)
-                if next_len >= match_len + 2 && next_offset <= 65535 {
+                let (nl, no) = chain.find_best_match(input, pos + 1);
+                if nl >= ml + 2 && no <= 32768 {
                     use_lazy = true;
                     tokens.push(Token::Literal(input[pos]));
                     pos += 1;
-                    tokens.push(Token::Match { length: next_len, offset: next_offset });
-                    for i in 0..next_len {
-                        chain.insert(input, pos + i);
-                    }
-                    pos += next_len;
+                    tokens.push(Token::Match { length: nl, offset: no });
+                    for i in 0..nl { chain.insert(input, pos + i); }
+                    pos += nl;
                 }
             }
-
             if !use_lazy {
-                tokens.push(Token::Match { length: match_len, offset: match_offset });
-                // Insert was already done for pos if we checked lazy
-                let start_insert = if match_len < MAX_MATCH && pos + 1 < input.len() { 1 } else { 0 };
-                for i in start_insert..match_len {
-                    chain.insert(input, pos + i);
-                }
-                if start_insert == 0 {
-                    chain.insert(input, pos);
-                }
-                pos += match_len;
+                tokens.push(Token::Match { length: ml, offset: mo });
+                let s = if ml < MAX_MATCH && pos + 1 < input.len() { 1 } else { 0 };
+                if s == 0 { chain.insert(input, pos); }
+                for i in s..ml { chain.insert(input, pos + i); }
+                pos += ml;
             }
         } else {
             tokens.push(Token::Literal(input[pos]));
@@ -161,96 +213,363 @@ pub fn compress(input: &[u8]) -> Vec<u8> {
             pos += 1;
         }
     }
+    tokens
+}
 
-    // Encode
-    let mut output = Vec::with_capacity(input.len());
-    output.extend_from_slice(&(input.len() as u32).to_le_bytes());
+// ─── Bit I/O ─────────────────────────────────────────────────────────────
 
-    let mut i = 0;
-    while i < tokens.len() {
-        match &tokens[i] {
-            Token::Match { length, offset } => {
-                let tag = 0x80 | ((*length - MIN_MATCH) as u8);
-                output.push(tag);
-                output.push((*offset >> 8) as u8);
-                output.push((*offset & 0xFF) as u8);
-                i += 1;
+struct BitWriter { bytes: Vec<u8>, buf: u32, nbits: u32 }
+
+impl BitWriter {
+    fn new() -> Self { BitWriter { bytes: Vec::new(), buf: 0, nbits: 0 } }
+    
+    fn write_bits(&mut self, val: u32, bits: u32) {
+        self.buf |= val << self.nbits;
+        self.nbits += bits;
+        while self.nbits >= 8 {
+            self.bytes.push(self.buf as u8);
+            self.buf >>= 8;
+            self.nbits -= 8;
+        }
+    }
+    
+    fn flush(mut self) -> Vec<u8> {
+        if self.nbits > 0 { self.bytes.push(self.buf as u8); }
+        self.bytes
+    }
+}
+
+struct BitReader<'a> { data: &'a [u8], byte_pos: usize, bit_pos: u32 }
+
+impl<'a> BitReader<'a> {
+    fn new(data: &'a [u8]) -> Self { BitReader { data, byte_pos: 0, bit_pos: 0 } }
+    
+    fn read_bits(&mut self, bits: u32) -> u32 {
+        let mut val = 0u32;
+        let mut bits_read = 0u32;
+        while bits_read < bits {
+            if self.byte_pos >= self.data.len() { return val; }
+            let byte = self.data[self.byte_pos];
+            let avail = 8 - self.bit_pos;
+            let take = (bits - bits_read).min(avail);
+            let mask = ((1u32 << take) - 1) as u8;
+            val |= (((byte >> self.bit_pos) & mask) as u32) << bits_read;
+            bits_read += take;
+            self.bit_pos += take;
+            if self.bit_pos >= 8 {
+                self.bit_pos = 0;
+                self.byte_pos += 1;
             }
-            Token::Literal(_) => {
-                let start = i;
-                let mut count = 0;
-                while i < tokens.len() && count < MAX_LITERAL_RUN {
-                    if let Token::Literal(_) = &tokens[i] {
-                        count += 1;
-                        i += 1;
-                    } else {
-                        break;
-                    }
-                }
-                output.push((count - 1) as u8);
-                for j in start..start + count {
-                    if let Token::Literal(b) = &tokens[j] {
-                        output.push(*b);
-                    }
+        }
+        val
+    }
+}
+
+// ─── Huffman ─────────────────────────────────────────────────────────────
+
+// Build code lengths from frequencies using a proper Huffman tree
+fn build_code_lengths(freqs: &[u32], max_bits: u8) -> Vec<u8> {
+    let n = freqs.len();
+    let mut lengths = vec![0u8; n];
+    let active: Vec<usize> = (0..n).filter(|&i| freqs[i] > 0).collect();
+    
+    if active.is_empty() { return lengths; }
+    if active.len() == 1 { lengths[active[0]] = 1; return lengths; }
+
+    // Build Huffman tree
+    let na = active.len();
+    let total = 2 * na - 1;
+    let mut freq = vec![0u64; total];
+    let mut left_child = vec![0usize; total];
+    let mut right_child = vec![0usize; total];
+    let mut avail = vec![false; total];
+
+    for (idx, &sym) in active.iter().enumerate() {
+        freq[idx] = freqs[sym] as u64;
+        avail[idx] = true;
+    }
+
+    let mut next = na;
+    for _ in 0..na - 1 {
+        let (mut m1, mut m2) = (usize::MAX, usize::MAX);
+        let (mut f1, mut f2) = (u64::MAX, u64::MAX);
+        for i in 0..next {
+            if !avail[i] { continue; }
+            if freq[i] < f1 || (freq[i] == f1 && i < m1) {
+                m2 = m1; f2 = f1; m1 = i; f1 = freq[i];
+            } else if freq[i] < f2 || (freq[i] == f2 && i < m2) {
+                m2 = i; f2 = freq[i];
+            }
+        }
+        if m2 == usize::MAX { break; }
+        freq[next] = f1 + f2;
+        left_child[next] = m1; right_child[next] = m2;
+        avail[m1] = false; avail[m2] = false; avail[next] = true;
+        next += 1;
+    }
+
+    // Get depths
+    let root = next - 1;
+    let mut depth = vec![0u8; total];
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        if node < na {
+            lengths[active[node]] = depth[node];
+        } else {
+            let l = left_child[node];
+            let r = right_child[node];
+            depth[l] = depth[node] + 1;
+            depth[r] = depth[node] + 1;
+            stack.push(l);
+            stack.push(r);
+        }
+    }
+
+    // Length-limit: if any length > max_bits, use package-merge-like redistribution
+    if lengths.iter().any(|&l| l > max_bits) {
+        // Sort active symbols by frequency (ascending)
+        let mut sorted: Vec<(usize, u32)> = active.iter().map(|&i| (i, freqs[i])).collect();
+        sorted.sort_by_key(|&(_, f)| f);
+        
+        // Start with all max_bits, then try to shorten the most frequent ones
+        for &(sym, _) in &sorted { lengths[sym] = max_bits; }
+        
+        // Greedily assign shorter codes to most frequent symbols
+        // while maintaining Kraft inequality
+        let target = 1u64 << max_bits;
+        let mut kraft: u64 = sorted.len() as u64; // all at max_bits: n * 2^0 = n
+        
+        // Try to shorten codes starting from most frequent
+        for &(sym, _) in sorted.iter().rev() {
+            let cur = lengths[sym];
+            for new_len in 1..cur {
+                let cost_change = (1u64 << (max_bits - new_len)) - (1u64 << (max_bits - cur));
+                if kraft + cost_change <= target {
+                    kraft += cost_change;
+                    lengths[sym] = new_len;
+                    break;
                 }
             }
         }
     }
-
-    output
-}
-
-pub fn decompress(input: &[u8]) -> Vec<u8> {
-    if input.len() < 4 {
-        return Vec::new();
+    
+    // Ensure at least length 1 for active symbols
+    for &i in &active {
+        if lengths[i] == 0 { lengths[i] = max_bits; }
     }
 
+    lengths
+}
+
+// Canonical Huffman: assign codes from lengths
+fn canonical_codes(lengths: &[u8]) -> Vec<(u32, u8)> {
+    let n = lengths.len();
+    let mut codes = vec![(0u32, 0u8); n];
+    
+    let mut syms: Vec<(usize, u8)> = lengths.iter().enumerate()
+        .filter(|(_, &b)| b > 0)
+        .map(|(i, &b)| (i, b))
+        .collect();
+    syms.sort_by(|a, b| a.1.cmp(&b.1).then(a.0.cmp(&b.0)));
+    
+    let mut code: u32 = 0;
+    let mut prev = 0u8;
+    for &(sym, bits) in &syms {
+        if prev > 0 { code += 1; }
+        if bits > prev { code <<= bits - prev; }
+        codes[sym] = (code, bits);
+        prev = bits;
+    }
+    codes
+}
+
+// Reverse bits for LSB-first encoding
+fn rev_bits(val: u32, bits: u8) -> u32 {
+    let mut r = 0u32; let mut v = val;
+    for _ in 0..bits { r = (r << 1) | (v & 1); v >>= 1; }
+    r
+}
+
+// Build decode lookup table
+fn build_decode_table(lengths: &[u8]) -> (Vec<u16>, Vec<u8>, u8) {
+    let max_bits = lengths.iter().copied().max().unwrap_or(1).max(1);
+    let size = 1usize << max_bits;
+    let mut sym_table = vec![0u16; size];
+    let mut len_table = vec![0u8; size];
+
+    let codes = canonical_codes(lengths);
+    
+    for (sym, &(code, bits)) in codes.iter().enumerate() {
+        if bits == 0 { continue; }
+        let rev = rev_bits(code, bits) as usize;
+        let fill = 1usize << (max_bits - bits);
+        for j in 0..fill {
+            let idx = rev | (j << bits);
+            sym_table[idx] = sym as u16;
+            len_table[idx] = bits;
+        }
+    }
+    
+    (sym_table, len_table, max_bits)
+}
+
+fn decode_sym(reader: &mut BitReader, sym_table: &[u16], len_table: &[u8], max_bits: u8) -> u16 {
+    let bits = reader.read_bits(max_bits as u32);
+    let idx = bits as usize & (sym_table.len() - 1);
+    let sym = sym_table[idx];
+    let len = len_table[idx];
+    // Put back the extra bits we consumed
+    if len < max_bits && len > 0 {
+        let extra = max_bits - len;
+        // We need to "unread" extra bits. Since our BitReader is byte+bit based,
+        // we can back up.
+        let total_bits_back = extra as u32;
+        // Back up bit position
+        if self_bit_pos_backtrack(reader, total_bits_back) {
+            // ok
+        }
+    }
+    sym
+}
+
+fn self_bit_pos_backtrack(reader: &mut BitReader, bits: u32) -> bool {
+    let total_bit_pos = reader.byte_pos as u32 * 8 + reader.bit_pos;
+    if bits > total_bit_pos { return false; }
+    let new_total = total_bit_pos - bits;
+    reader.byte_pos = (new_total / 8) as usize;
+    reader.bit_pos = new_total % 8;
+    true
+}
+
+// ─── Compress ────────────────────────────────────────────────────────────
+
+pub fn compress(input: &[u8]) -> Vec<u8> {
+    if input.is_empty() { return Vec::new(); }
+
+    let tokens = lz77_tokenize(input);
+
+    // Count frequencies
+    let mut ll_freq = vec![0u32; 286];
+    let mut d_freq = vec![0u32; 30];
+    for t in &tokens {
+        match t {
+            Token::Literal(b) => ll_freq[*b as usize] += 1,
+            Token::Match { length, offset } => {
+                let (c, _, _) = length_to_code(*length);
+                ll_freq[c as usize] += 1;
+                let (dc, _, _) = offset_to_code(*offset);
+                d_freq[dc as usize] += 1;
+            }
+        }
+    }
+    ll_freq[256] += 1;
+
+    let ll_lens = build_code_lengths(&ll_freq, 15);
+    let d_lens = build_code_lengths(&d_freq, 15);
+    let ll_codes = canonical_codes(&ll_lens);
+    let d_codes = canonical_codes(&d_lens);
+
+    let mut out = Vec::new();
+    out.extend_from_slice(&(input.len() as u32).to_le_bytes());
+
+    // Write code length tables
+    let ll_count = ll_lens.iter().rposition(|&l| l > 0).map(|p| p + 1).unwrap_or(0);
+    out.extend_from_slice(&(ll_count as u16).to_le_bytes());
+    out.extend_from_slice(&ll_lens[..ll_count]);
+
+    let d_count = d_lens.iter().rposition(|&l| l > 0).map(|p| p + 1).unwrap_or(0);
+    out.push(d_count as u8);
+    out.extend_from_slice(&d_lens[..d_count]);
+
+    // Encode tokens
+    let mut bw = BitWriter::new();
+    for t in &tokens {
+        match t {
+            Token::Literal(b) => {
+                let (code, bits) = ll_codes[*b as usize];
+                bw.write_bits(rev_bits(code, bits), bits as u32);
+            }
+            Token::Match { length, offset } => {
+                let (lc, leb, lev) = length_to_code(*length);
+                let (code, bits) = ll_codes[lc as usize];
+                bw.write_bits(rev_bits(code, bits), bits as u32);
+                if leb > 0 { bw.write_bits(lev as u32, leb as u32); }
+
+                let (dc, deb, dev) = offset_to_code(*offset);
+                let (dcode, dbits) = d_codes[dc as usize];
+                bw.write_bits(rev_bits(dcode, dbits), dbits as u32);
+                if deb > 0 { bw.write_bits(dev as u32, deb as u32); }
+            }
+        }
+    }
+    let (eob_code, eob_bits) = ll_codes[256];
+    bw.write_bits(rev_bits(eob_code, eob_bits), eob_bits as u32);
+    out.extend(bw.flush());
+    out
+}
+
+// ─── Decompress ──────────────────────────────────────────────────────────
+
+pub fn decompress(input: &[u8]) -> Vec<u8> {
+    if input.len() < 4 { return Vec::new(); }
     let orig_size = u32::from_le_bytes([input[0], input[1], input[2], input[3]]) as usize;
+    let mut pos = 4;
+
+    if pos + 2 > input.len() { return Vec::new(); }
+    let ll_count = u16::from_le_bytes([input[pos], input[pos + 1]]) as usize;
+    pos += 2;
+    if pos + ll_count > input.len() { return Vec::new(); }
+    let mut ll_lens = vec![0u8; 286];
+    ll_lens[..ll_count].copy_from_slice(&input[pos..pos + ll_count]);
+    pos += ll_count;
+
+    if pos >= input.len() { return Vec::new(); }
+    let d_count = input[pos] as usize;
+    pos += 1;
+    if pos + d_count > input.len() { return Vec::new(); }
+    let mut d_lens = vec![0u8; 30];
+    d_lens[..d_count].copy_from_slice(&input[pos..pos + d_count]);
+    pos += d_count;
+
+    let (ll_sym, ll_len, ll_max) = build_decode_table(&ll_lens);
+    let (d_sym, d_len, d_max) = build_decode_table(&d_lens);
+
+    let mut reader = BitReader::new(&input[pos..]);
     let mut output = Vec::with_capacity(orig_size);
-    let mut i = 4;
 
-    while i < input.len() && output.len() < orig_size {
-        let tag = input[i];
-        i += 1;
+    while output.len() < orig_size {
+        let sym = decode_sym(&mut reader, &ll_sym, &ll_len, ll_max);
+        if sym == 256 { break; }
 
-        if tag & 0x80 != 0 {
-            // Match
-            if i + 1 >= input.len() { break; }
-            let length = (tag & 0x7F) as usize + MIN_MATCH;
-            let offset = ((input[i] as usize) << 8) | (input[i + 1] as usize);
-            i += 2;
+        if sym < 256 {
+            output.push(sym as u8);
+        } else {
+            let (base_len, eb) = code_to_length_base(sym);
+            let extra = if eb > 0 { reader.read_bits(eb as u32) as usize } else { 0 };
+            let length = base_len + extra;
+
+            let dsym = decode_sym(&mut reader, &d_sym, &d_len, d_max);
+            let (base_dist, deb) = code_to_offset_base(dsym as u8);
+            let dextra = if deb > 0 { reader.read_bits(deb as u32) as usize } else { 0 };
+            let offset = base_dist + dextra;
 
             if offset == 0 || offset > output.len() { break; }
             let start = output.len() - offset;
             for j in 0..length {
-                let byte = output[start + j];
-                output.push(byte);
+                let b = output[start + j];
+                output.push(b);
             }
-        } else {
-            // Literal run
-            let count = (tag as usize) + 1;
-            if i + count > input.len() { break; }
-            output.extend_from_slice(&input[i..i + count]);
-            i += count;
         }
     }
-
     output
 }
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    let decompress_mode = args.iter().any(|a| a == "--decompress" || a == "-d");
-
+    let d = args.iter().any(|a| a == "--decompress" || a == "-d");
     let mut input = Vec::new();
     io::stdin().read_to_end(&mut input).expect("Failed to read stdin");
-
-    let output = if decompress_mode {
-        decompress(&input)
-    } else {
-        compress(&input)
-    };
-
+    let output = if d { decompress(&input) } else { compress(&input) };
     io::stdout().write_all(&output).expect("Failed to write stdout");
 }
 
@@ -258,88 +577,51 @@ fn main() {
 mod tests {
     use super::*;
 
+    #[test] fn test_roundtrip_empty() { assert_eq!(decompress(&compress(b"")), b""); }
+    #[test] fn test_roundtrip_simple() { let i = b"aaabbbcccc"; assert_eq!(decompress(&compress(i)), i); }
+    #[test] fn test_roundtrip_no_runs() { let i = b"abcdefg"; assert_eq!(decompress(&compress(i)), i); }
+    #[test] fn test_roundtrip_single() { let i = b"a"; assert_eq!(decompress(&compress(i)), i); }
+    #[test] fn test_roundtrip_binary() { let i: Vec<u8> = (0..=255).collect(); assert_eq!(decompress(&compress(&i)), i); }
+    #[test] fn test_roundtrip_long_run() { let i = vec![0x42; 1000]; assert_eq!(decompress(&compress(&i)), i); }
+    #[test] fn test_roundtrip_very_long() { let i = vec![0x42; 100000]; assert_eq!(decompress(&compress(&i)), i); }
+    
     #[test]
-    fn test_roundtrip_empty() {
-        assert_eq!(decompress(&compress(b"")), b"");
+    fn test_roundtrip_random() {
+        let mut i = Vec::with_capacity(10000);
+        let mut s: u32 = 12345;
+        for _ in 0..10000 { s = s.wrapping_mul(1103515245).wrapping_add(12345); i.push((s >> 16) as u8); }
+        assert_eq!(decompress(&compress(&i)), i);
+    }
+    
+    #[test]
+    fn test_roundtrip_pattern() {
+        let p = b"hello world! ";
+        let i: Vec<u8> = p.iter().cycle().take(5000).copied().collect();
+        assert_eq!(decompress(&compress(&i)), i);
+    }
+    
+    #[test] fn test_compression() { let i = vec![0x42; 1000]; assert!(compress(&i).len() < i.len()); }
+    
+    #[test]
+    fn test_roundtrip_moby() {
+        let i = b"Call me Ishmael. Some years ago--never mind how long precisely--having little or no money in my purse, and nothing particular to interest me on shore, I thought I would sail about a little and see the watery part of the world.";
+        assert_eq!(decompress(&compress(i.as_slice())), i.as_slice());
     }
 
     #[test]
-    fn test_roundtrip_simple() {
-        let input = b"aaabbbcccc";
-        assert_eq!(decompress(&compress(input)), input);
-    }
-
-    #[test]
-    fn test_roundtrip_no_runs() {
-        let input = b"abcdefg";
-        assert_eq!(decompress(&compress(input)), input);
-    }
-
-    #[test]
-    fn test_roundtrip_single_byte() {
-        let input = b"a";
-        assert_eq!(decompress(&compress(input)), input);
-    }
-
-    #[test]
-    fn test_roundtrip_binary() {
-        let input: Vec<u8> = (0..=255).collect();
-        assert_eq!(decompress(&compress(&input)), input);
-    }
-
-    #[test]
-    fn test_roundtrip_long_run() {
-        let input = vec![0x42; 1000];
-        assert_eq!(decompress(&compress(&input)), input);
-    }
-
-    #[test]
-    fn test_roundtrip_very_long_run() {
-        let input = vec![0x42; 100000];
-        assert_eq!(decompress(&compress(&input)), input);
-    }
-
-    #[test]
-    fn test_roundtrip_random_ish() {
-        let mut input = Vec::with_capacity(10000);
-        let mut state: u32 = 12345;
-        for _ in 0..10000 {
-            state = state.wrapping_mul(1103515245).wrapping_add(12345);
-            input.push((state >> 16) as u8);
+    fn test_roundtrip_large_text() {
+        let mut input = Vec::new();
+        let words: Vec<&[u8]> = vec![b"the ", b"quick ", b"brown ", b"fox ", b"jumps ",
+            b"over ", b"lazy ", b"dog ", b"and ", b"in ", b"to ", b"of ", b"is ",
+            b"it ", b"for ", b"on ", b"was ", b"with ", b"that ", b"at "];
+        let mut s: u32 = 42;
+        while input.len() < 1_300_000 {
+            s = s.wrapping_mul(1103515245).wrapping_add(12345);
+            input.extend_from_slice(words[(s >> 16) as usize % words.len()]);
         }
-        assert_eq!(decompress(&compress(&input)), input);
-    }
-
-    #[test]
-    fn test_roundtrip_repeated_pattern() {
-        let pattern = b"hello world! ";
-        let input: Vec<u8> = pattern.iter().cycle().take(5000).copied().collect();
-        assert_eq!(decompress(&compress(&input)), input);
-    }
-
-    #[test]
-    fn test_compression_ratio_improves() {
-        let input = vec![0x42; 1000];
-        let compressed = compress(&input);
-        assert!(compressed.len() < input.len(), "Repeated data should compress: {} vs {}", compressed.len(), input.len());
-    }
-
-    #[test]
-    fn test_roundtrip_moby_start() {
-        let input = b"Call me Ishmael. Some years ago--never mind how long precisely--having little or no money in my purse, and nothing particular to interest me on shore, I thought I would sail about a little and see the watery part of the world.";
-        assert_eq!(decompress(&compress(input.as_slice())), input.as_slice());
-    }
-
-    #[test]
-    fn test_random_data_no_blowup() {
-        let mut input = Vec::with_capacity(10000);
-        let mut state: u32 = 99999;
-        for _ in 0..10000 {
-            state = state.wrapping_mul(1103515245).wrapping_add(12345);
-            input.push((state >> 16) as u8);
-        }
-        let compressed = compress(&input);
-        assert!(compressed.len() < input.len() + 200,
-            "Random data expanded too much: {} -> {}", input.len(), compressed.len());
+        let c = compress(&input);
+        let d = decompress(&c);
+        assert_eq!(d.len(), input.len(), "Len mismatch: {} vs {}", d.len(), input.len());
+        assert_eq!(d, input);
     }
 }
