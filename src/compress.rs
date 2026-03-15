@@ -383,29 +383,89 @@ fn decode_sym(reader: &mut BitReader, sym_table: &[u16], len_table: &[u8], max_b
 
 // ─── BWT (Burrows-Wheeler Transform) ─────────────────────────────────────
 
+/// Cyclic BWT using prefix doubling with radix sort — O(n log n).
+/// Uses cyclic rank access (rank[(i+k) % n]) on n elements.
 fn bwt_forward(data: &[u8]) -> (Vec<u8>, u32) {
     let n = data.len();
     if n == 0 { return (Vec::new(), 0); }
-    // Sort rotation indices using cyclic comparison
-    let mut indices: Vec<u32> = (0..n as u32).collect();
-    // Use radix + merge sort approach for speed
-    indices.sort_unstable_by(|&a, &b| {
-        let a = a as usize;
-        let b = b as usize;
-        // Compare up to n bytes cyclically
-        let mut i = 0;
-        while i < n {
-            // Compare in chunks for speed
-            let ca = data[(a + i) % n];
-            let cb = data[(b + i) % n];
-            if ca != cb { return ca.cmp(&cb); }
-            i += 1;
+    if n == 1 { return (data.to_vec(), 0); }
+
+    let mut sa: Vec<u32> = (0..n as u32).collect();
+    let mut rank = vec![0u32; n];
+    let mut new_rank = vec![0u32; n];
+    let mut tmp = vec![0u32; n];
+
+    // Initial sort by first character
+    {
+        let mut count = [0u32; 256];
+        for &b in data { count[b as usize] += 1; }
+        let mut pos = [0u32; 256];
+        for i in 1..256 { pos[i] = pos[i-1] + count[i-1]; }
+        for i in 0..n {
+            sa[pos[data[i] as usize] as usize] = i as u32;
+            pos[data[i] as usize] += 1;
         }
-        std::cmp::Ordering::Equal
-    });
+        new_rank[sa[0] as usize] = 0;
+        for i in 1..n {
+            new_rank[sa[i] as usize] = new_rank[sa[i-1] as usize]
+                + if data[sa[i] as usize] != data[sa[i-1] as usize] { 1 } else { 0 };
+        }
+        rank.copy_from_slice(&new_rank);
+    }
+
+    let mut count = vec![0u32; n + 1];
+    let mut pos = vec![0u32; n + 1];
+
+    let mut k: usize = 1;
+    while k < n {
+        if rank[sa[n-1] as usize] as usize == n - 1 { break; }
+
+        let num_ranks = rank[sa[n-1] as usize] as usize + 1;
+
+        // Radix sort by (rank[i], rank[(i+k) % n])
+        // Step 1: Sort by second key (cyclic)
+        for i in 0..=num_ranks { count[i] = 0; }
+        for i in 0..n {
+            count[rank[(sa[i] as usize + k) % n] as usize] += 1;
+        }
+        pos[0] = 0;
+        for i in 1..=num_ranks { pos[i] = pos[i-1] + count[i-1]; }
+        for i in 0..n {
+            let r2 = rank[(sa[i] as usize + k) % n] as usize;
+            tmp[pos[r2] as usize] = sa[i];
+            pos[r2] += 1;
+        }
+
+        // Step 2: Stable sort by first key
+        for i in 0..=num_ranks { count[i] = 0; }
+        for i in 0..n { count[rank[tmp[i] as usize] as usize] += 1; }
+        pos[0] = 0;
+        for i in 1..=num_ranks { pos[i] = pos[i-1] + count[i-1]; }
+        for i in 0..n {
+            let r1 = rank[tmp[i] as usize] as usize;
+            sa[pos[r1] as usize] = tmp[i];
+            pos[r1] += 1;
+        }
+
+        // Assign new ranks
+        new_rank[sa[0] as usize] = 0;
+        for i in 1..n {
+            let prev = sa[i-1] as usize;
+            let curr = sa[i] as usize;
+            let rp2 = rank[(prev + k) % n];
+            let rc2 = rank[(curr + k) % n];
+            new_rank[curr] = new_rank[prev]
+                + if rank[prev] != rank[curr] || rp2 != rc2 { 1 } else { 0 };
+        }
+
+        rank.copy_from_slice(&new_rank);
+        k *= 2;
+    }
+
+    // Extract BWT
     let mut output = Vec::with_capacity(n);
     let mut orig_idx = 0u32;
-    for (i, &s) in indices.iter().enumerate() {
+    for (i, &s) in sa.iter().enumerate() {
         if s == 0 { orig_idx = i as u32; }
         output.push(data[(s as usize + n - 1) % n]);
     }
@@ -499,6 +559,309 @@ fn rle_zero_decode(data: &[u16]) -> Vec<u8> {
         }
     }
     out
+}
+
+// ─── Context Mixing Compressor ───────────────────────────────────────────
+// PAQ/cmix-style: order-0..6 + match model, logistic mixing, range coder.
+
+fn cm_init_stretch() -> [i16; 4097] {
+    let mut t = [0i16; 4097];
+    for i in 1..4096 {
+        let p = i as f64 / 4096.0;
+        t[i] = ((p / (1.0 - p)).ln() * 64.0).round().max(-2047.0).min(2047.0) as i16;
+    }
+    t[0] = -2047;
+    t[4096] = 2047;
+    t
+}
+
+fn cm_init_squash() -> [u16; 4096] {
+    let mut t = [0u16; 4096];
+    for i in 0..4096 {
+        let s = (i as f64 - 2048.0) / 64.0;
+        let p = 1.0 / (1.0 + (-s).exp());
+        t[i] = (p * 4096.0).round().max(1.0).min(4095.0) as u16;
+    }
+    t
+}
+
+#[inline]
+fn cm_pred(counts: &[u16; 2]) -> u32 {
+    let c0 = counts[0] as u32 + 1;
+    let c1 = counts[1] as u32 + 1;
+    c0 * 4096 / (c0 + c1)
+}
+
+#[inline]
+fn cm_update_count(counts: &mut [u16; 2], bit: u8) {
+    counts[bit as usize] += 1;
+    if counts[0] as u32 + counts[1] as u32 > 4096 {
+        counts[0] = (counts[0] >> 1) + 1;
+        counts[1] = (counts[1] >> 1) + 1;
+    }
+}
+
+#[inline]
+fn cm_hash(a: usize, b: usize) -> usize {
+    a.wrapping_mul(0x9E3779B9).wrapping_add(b)
+}
+
+struct RangeEnc {
+    low: u64,
+    range: u32,
+    cache: u8,
+    cache_size: u32,
+    output: Vec<u8>,
+}
+
+impl RangeEnc {
+    fn new() -> Self {
+        RangeEnc { low: 0, range: 0xFFFFFFFF, cache: 0, cache_size: 1, output: Vec::new() }
+    }
+    fn shift_low(&mut self) {
+        let low_hi = (self.low >> 32) as u8;
+        if (self.low as u32) < 0xFF000000 || low_hi != 0 {
+            self.output.push(self.cache.wrapping_add(low_hi));
+            for _ in 1..self.cache_size {
+                self.output.push(0xFF_u8.wrapping_add(low_hi));
+            }
+            self.cache = (self.low >> 24) as u8;
+            self.cache_size = 1;
+        } else {
+            self.cache_size += 1;
+        }
+        self.low = ((self.low as u32) << 8) as u64;
+    }
+    fn encode(&mut self, p0: u32, bit: u8) {
+        let bound = (self.range >> 12) * p0;
+        if bit == 0 {
+            self.range = bound;
+        } else {
+            self.low += bound as u64;
+            self.range -= bound;
+        }
+        while self.range < (1 << 24) {
+            self.range <<= 8;
+            self.shift_low();
+        }
+    }
+    fn flush(&mut self) {
+        for _ in 0..5 { self.shift_low(); }
+    }
+}
+
+struct RangeDec<'a> {
+    range: u32,
+    code: u32,
+    data: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> RangeDec<'a> {
+    fn new(data: &'a [u8]) -> Self {
+        let mut dec = RangeDec { range: 0xFFFFFFFF, code: 0, data, pos: 0 };
+        for _ in 0..5 { dec.code = (dec.code << 8) | dec.read_byte() as u32; }
+        dec
+    }
+    fn read_byte(&mut self) -> u8 {
+        if self.pos < self.data.len() { let b = self.data[self.pos]; self.pos += 1; b } else { 0 }
+    }
+    fn decode(&mut self, p0: u32) -> u8 {
+        let bound = (self.range >> 12) * p0;
+        let bit;
+        if self.code < bound {
+            bit = 0; self.range = bound;
+        } else {
+            bit = 1; self.code -= bound; self.range -= bound;
+        }
+        while self.range < (1 << 24) {
+            self.code = (self.code << 8) | self.read_byte() as u32;
+            self.range <<= 8;
+        }
+        bit
+    }
+}
+
+const CM_H_BITS: usize = 20;
+const CM_H_SIZE: usize = 1 << CM_H_BITS;
+const CM_H_MASK: usize = CM_H_SIZE - 1;
+const CM_N: usize = 8;
+
+struct CMixer {
+    o0: Vec<[u16; 2]>,
+    o1: Vec<[u16; 2]>,
+    o2: Vec<[u16; 2]>,
+    o3: Vec<[u16; 2]>,
+    o4: Vec<[u16; 2]>,
+    o6: Vec<[u16; 2]>,
+    ow: Vec<[u16; 2]>,
+    weights: [i32; CM_N],
+    prev: [u8; 8],
+    word_ctx: usize,
+    match_table: Vec<u32>,
+    match_buf: Vec<u8>,
+    match_active: bool,
+    match_byte: u8,
+    st: Box<[i16; 4097]>,
+    sq: Box<[u16; 4096]>,
+}
+
+impl CMixer {
+    fn new() -> Self {
+        CMixer {
+            o0: vec![[0u16; 2]; 512],
+            o1: vec![[0u16; 2]; 65536],
+            o2: vec![[0u16; 2]; CM_H_SIZE],
+            o3: vec![[0u16; 2]; CM_H_SIZE],
+            o4: vec![[0u16; 2]; CM_H_SIZE],
+            o6: vec![[0u16; 2]; CM_H_SIZE],
+            ow: vec![[0u16; 2]; CM_H_SIZE],
+            weights: [512, 1024, 1536, 1536, 1024, 512, 768, 1024],
+            prev: [0; 8],
+            word_ctx: 0,
+            match_table: vec![0u32; 1 << 20],
+            match_buf: Vec::new(),
+            match_active: false,
+            match_byte: 0,
+            st: Box::new(cm_init_stretch()),
+            sq: Box::new(cm_init_squash()),
+        }
+    }
+
+    fn start_byte(&mut self) {
+        let h = cm_hash(cm_hash(cm_hash(cm_hash(
+            self.prev[3] as usize, self.prev[2] as usize),
+            self.prev[1] as usize), self.prev[0] as usize), 0x12345);
+        let mask = self.match_table.len() - 1;
+        let idx = h & mask;
+        let pp = self.match_table[idx] as usize;
+        let cp = self.match_buf.len();
+        self.match_active = false;
+        if pp > 0 && pp < cp && cp >= 4 && pp >= 4 {
+            let ok = (0..4).all(|i| self.match_buf[pp - 4 + i] == self.match_buf[cp - 4 + i]);
+            if ok && pp < self.match_buf.len() {
+                self.match_active = true;
+                self.match_byte = self.match_buf[pp];
+            }
+        }
+        self.match_table[idx] = cp as u32;
+    }
+
+    fn predict(&self, partial: usize) -> (u32, [i16; CM_N], [usize; 7]) {
+        let p0 = self.prev[0] as usize;
+        let ctxs = [
+            partial,
+            p0 * 256 + partial,
+            cm_hash(cm_hash(self.prev[1] as usize, p0), partial) & CM_H_MASK,
+            cm_hash(cm_hash(cm_hash(self.prev[2] as usize, self.prev[1] as usize), p0), partial) & CM_H_MASK,
+            cm_hash(cm_hash(cm_hash(cm_hash(self.prev[3] as usize, self.prev[2] as usize), self.prev[1] as usize), p0), partial) & CM_H_MASK,
+            cm_hash(cm_hash(cm_hash(cm_hash(cm_hash(cm_hash(self.prev[5] as usize, self.prev[4] as usize), self.prev[3] as usize), self.prev[2] as usize), self.prev[1] as usize), p0) ^ partial, 0xABCD) & CM_H_MASK,
+            cm_hash(self.word_ctx, partial) & CM_H_MASK,
+        ];
+        let tables: [&[[u16; 2]]; 7] = [&self.o0, &self.o1, &self.o2, &self.o3, &self.o4, &self.o6, &self.ow];
+        let mut stretched = [0i16; CM_N];
+        let mut sum: i64 = 0;
+        for i in 0..7 {
+            let p = cm_pred(&tables[i][ctxs[i]]);
+            stretched[i] = self.st[p.min(4096) as usize];
+            sum += self.weights[i] as i64 * stretched[i] as i64;
+        }
+        if self.match_active {
+            let bit_pos = match partial {
+                1 => 7, 2..=3 => 6, 4..=7 => 5, 8..=15 => 4,
+                16..=31 => 3, 32..=63 => 2, 64..=127 => 1, _ => 0,
+            };
+            let pred_bit = (self.match_byte >> bit_pos) & 1;
+            let mp = if pred_bit == 0 { 3900u32 } else { 196 };
+            stretched[7] = self.st[mp.min(4096) as usize];
+            sum += self.weights[7] as i64 * stretched[7] as i64;
+        }
+        let w_total: i64 = self.weights.iter().map(|&w| w.abs() as i64).sum::<i64>().max(1);
+        let s_mix = (sum / w_total) as i32;
+        let idx = (s_mix + 2048).max(0).min(4095) as usize;
+        let p_mix = (self.sq[idx] as u32).max(1).min(4095);
+        (p_mix, stretched, ctxs)
+    }
+
+    fn update(&mut self, _partial: usize, bit: u8, p_mix: u32, stretched: &[i16; CM_N], ctxs: &[usize; 7]) {
+        // Gradient descent: err = p0_mix - target_p0 (positive when over-predicting 0)
+        // When bit=0: target=4096, err = p_mix - 4096 (negative → increase weights of 0-predictors)
+        // When bit=1: target=0, err = p_mix (positive → decrease weights of 0-predictors)
+        let err = if bit == 1 { p_mix as i32 } else { p_mix as i32 - 4096 };
+        for i in 0..CM_N {
+            // Gradient descent: w -= lr * err * stretch
+            self.weights[i] -= ((12i64 * err as i64 * stretched[i] as i64) >> 16) as i32;
+            self.weights[i] = self.weights[i].max(1).min(65536);
+        }
+        cm_update_count(&mut self.o0[ctxs[0]], bit);
+        cm_update_count(&mut self.o1[ctxs[1]], bit);
+        cm_update_count(&mut self.o2[ctxs[2]], bit);
+        cm_update_count(&mut self.o3[ctxs[3]], bit);
+        cm_update_count(&mut self.o4[ctxs[4]], bit);
+        cm_update_count(&mut self.o6[ctxs[5]], bit);
+        cm_update_count(&mut self.ow[ctxs[6]], bit);
+    }
+
+    fn finish_byte(&mut self, byte: u8) {
+        self.match_buf.push(byte);
+        if byte.is_ascii_alphabetic() || byte == b'\'' {
+            self.word_ctx = cm_hash(self.word_ctx, byte.to_ascii_lowercase() as usize);
+        } else {
+            self.word_ctx = 0;
+        }
+        for i in (1..8).rev() { self.prev[i] = self.prev[i - 1]; }
+        self.prev[0] = byte;
+    }
+}
+
+fn cm_compress(input: &[u8]) -> Vec<u8> {
+    if input.is_empty() { return Vec::new(); }
+    let mut m = CMixer::new();
+    let mut enc = RangeEnc::new();
+    for &byte in input {
+        m.start_byte();
+        let mut partial: usize = 1;
+        for bit_idx in (0..8).rev() {
+            let bit = ((byte >> bit_idx) & 1) as u8;
+            let (p0, stretched, ctxs) = m.predict(partial);
+            enc.encode(p0, bit);
+            m.update(partial, bit, p0, &stretched, &ctxs);
+            partial = partial * 2 + bit as usize;
+        }
+        m.finish_byte(byte);
+    }
+    enc.flush();
+    let mut out = Vec::new();
+    out.extend_from_slice(&(input.len() as u32).to_le_bytes());
+    out.extend_from_slice(&(enc.output.len() as u32).to_le_bytes());
+    out.extend_from_slice(&enc.output);
+    out
+}
+
+fn cm_decompress(input: &[u8]) -> Vec<u8> {
+    if input.len() < 8 { return Vec::new(); }
+    let orig_size = u32::from_le_bytes([input[0], input[1], input[2], input[3]]) as usize;
+    let enc_size = u32::from_le_bytes([input[4], input[5], input[6], input[7]]) as usize;
+    if input.len() < 8 + enc_size { return Vec::new(); }
+    let enc_data = &input[8..8 + enc_size];
+    let mut m = CMixer::new();
+    let mut dec = RangeDec::new(enc_data);
+    let mut output = Vec::with_capacity(orig_size);
+    for _ in 0..orig_size {
+        m.start_byte();
+        let mut partial: usize = 1;
+        let mut byte: u8 = 0;
+        for bit_idx in (0..8).rev() {
+            let (p0, stretched, ctxs) = m.predict(partial);
+            let bit = dec.decode(p0);
+            m.update(partial, bit, p0, &stretched, &ctxs);
+            if bit == 1 { byte |= 1 << bit_idx; }
+            partial = partial * 2 + bit as usize;
+        }
+        output.push(byte);
+        m.finish_byte(byte);
+    }
+    output
 }
 
 /// BWT pipeline: BWT → MTF → RLE → Huffman encode
@@ -777,24 +1140,28 @@ pub fn compress(input: &[u8]) -> Vec<u8> {
     // Try LZ77 pipeline
     let lz77_result = lz77_compress(input);
     
-    // Try BWT pipeline (only for inputs that aren't too large — BWT is O(n log²n))
-    let bwt_result = if input.len() <= 500_000 {
-        bwt_compress(input)
-    } else {
-        Vec::new() // skip for very large inputs
-    };
+    // Try BWT pipeline
+    let bwt_result = bwt_compress(input);
     
-    // Pick the smaller result, prefixed with a mode byte
-    let use_bwt = !bwt_result.is_empty() && bwt_result.len() < lz77_result.len();
+    // Try context mixing pipeline
+    let cm_result = cm_compress(input);
     
-    let mut out = Vec::new();
-    if use_bwt {
-        out.push(1u8); // BWT mode
-        out.extend_from_slice(&bwt_result);
-    } else {
-        out.push(0u8); // LZ77 mode
-        out.extend_from_slice(&lz77_result);
+    eprintln!("  LZ77: {} BWT: {} CM: {} (input {})", lz77_result.len(), bwt_result.len(), cm_result.len(), input.len());
+    
+    // Pick the smallest result, prefixed with a mode byte
+    let mut best = &lz77_result;
+    let mut best_mode = 0u8;
+    if !bwt_result.is_empty() && bwt_result.len() < best.len() {
+        best = &bwt_result;
+        best_mode = 1;
     }
+    if cm_result.len() < best.len() {
+        best = &cm_result;
+        best_mode = 2;
+    }
+    let mut out = Vec::with_capacity(1 + best.len());
+    out.push(best_mode);
+    out.extend_from_slice(best);
     out
 }
 
@@ -891,6 +1258,7 @@ pub fn decompress(input: &[u8]) -> Vec<u8> {
     let data = &input[1..];
     match mode {
         1 => bwt_decompress(data),
+        2 => cm_decompress(data),
         _ => lz77_decompress(data),
     }
 }
