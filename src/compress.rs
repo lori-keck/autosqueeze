@@ -857,6 +857,16 @@ pub fn compress(input: &[u8]) -> Vec<u8> {
         best = &lzw_result;
         best_mode = 2;
     }
+    // Mode 3: BWT -> LZ77 chain
+    if !bwt_result.is_empty() {
+        let bwt_lz77 = lz77_compress(&bwt_result);
+        if bwt_lz77.len() < best.len() {
+            let mut out = Vec::with_capacity(1 + bwt_lz77.len());
+            out.push(3u8);
+            out.extend_from_slice(&bwt_lz77);
+            return out;
+        }
+    }
     let mut out = Vec::with_capacity(1 + best.len());
     out.push(best_mode);
     out.extend_from_slice(best);
@@ -1090,6 +1100,10 @@ pub fn decompress(input: &[u8]) -> Vec<u8> {
     match mode {
         1 => bwt_decompress(data),
         2 => lzw_decompress(data),
+        3 => {
+            let lz77_dec = lz77_decompress(data);
+            bwt_decompress(&lz77_dec)
+        }
         _ => lz77_decompress(data),
     }
 }
