@@ -14,7 +14,7 @@ use std::io::{self, Read, Write};
 const WINDOW_SIZE: usize = 1048576; // 1MB window
 const MIN_MATCH: usize = 3;
 const MAX_MATCH: usize = 258;
-const HASH_CHAIN_LIMIT: usize = 128;
+const HASH_CHAIN_LIMIT: usize = 512;
 const BLOCK_SIZE: usize = 32768;
 
 // ─── DEFLATE length/distance tables ──────────────────────────────────────
