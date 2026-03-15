@@ -388,26 +388,51 @@ fn decode_sym(reader: &mut BitReader, sym_table: &[u16], len_table: &[u8], max_b
 fn bwt_forward(data: &[u8]) -> (Vec<u8>, u32) {
     let n = data.len();
     if n == 0 { return (Vec::new(), 0); }
-    // Sort rotation indices using cyclic comparison
-    let mut indices: Vec<u32> = (0..n as u32).collect();
-    // Use radix + merge sort approach for speed
-    indices.sort_unstable_by(|&a, &b| {
-        let a = a as usize;
-        let b = b as usize;
-        // Compare up to n bytes cyclically
-        let mut i = 0;
-        while i < n {
-            // Compare in chunks for speed
-            let ca = data[(a + i) % n];
-            let cb = data[(b + i) % n];
-            if ca != cb { return ca.cmp(&cb); }
-            i += 1;
+    if n == 1 { return (data.to_vec(), 0); }
+    // Prefix-doubling with radix sort: O(n log n) vs naive O(n² log n)
+    let mut sa = vec![0u32; n];
+    let mut sa2 = vec![0u32; n];
+    let mut rank = vec![0u32; n];
+    let mut new_rank = vec![0u32; n];
+    {
+        let mut cnt = [0u32; 256];
+        for &b in data { cnt[b as usize] += 1; }
+        let mut cum = [0u32; 257];
+        for i in 0..256 { cum[i + 1] = cum[i] + cnt[i]; }
+        let mut c = cum;
+        for i in 0..n { sa[c[data[i] as usize] as usize] = i as u32; c[data[i] as usize] += 1; }
+    }
+    new_rank[sa[0] as usize] = 0;
+    for i in 1..n {
+        new_rank[sa[i] as usize] = new_rank[sa[i-1] as usize]
+            + if data[sa[i] as usize] != data[sa[i-1] as usize] { 1 } else { 0 };
+    }
+    for i in 0..n { rank[i] = new_rank[i]; }
+    let mut nc = rank[sa[n-1] as usize] as usize + 1;
+    let mut k = 1usize;
+    while k < n && nc < n {
+        let mut cnt = vec![0u32; nc + 1];
+        let mut cum = vec![0u32; nc + 2];
+        for i in 0..n { cnt[rank[(sa[i] as usize + k) % n] as usize] += 1; }
+        for i in 0..=nc { cum[i + 1] = cum[i] + cnt[i]; }
+        for i in 0..n { let r = rank[(sa[i] as usize + k) % n] as usize; sa2[cum[r] as usize] = sa[i]; cum[r] += 1; }
+        for v in cnt.iter_mut() { *v = 0; }
+        for i in 0..n { cnt[rank[sa2[i] as usize] as usize] += 1; }
+        for v in cum.iter_mut() { *v = 0; }
+        for i in 0..=nc { cum[i + 1] = cum[i] + cnt[i]; }
+        for i in 0..n { let r = rank[sa2[i] as usize] as usize; sa[cum[r] as usize] = sa2[i]; cum[r] += 1; }
+        new_rank[sa[0] as usize] = 0;
+        for i in 1..n {
+            let (p, c) = (sa[i-1] as usize, sa[i] as usize);
+            new_rank[c] = new_rank[p] + if rank[c] != rank[p] || rank[(c+k)%n] != rank[(p+k)%n] { 1 } else { 0 };
         }
-        std::cmp::Ordering::Equal
-    });
+        nc = new_rank[sa[n-1] as usize] as usize + 1;
+        for i in 0..n { rank[i] = new_rank[i]; }
+        k *= 2;
+    }
     let mut output = Vec::with_capacity(n);
     let mut orig_idx = 0u32;
-    for (i, &s) in indices.iter().enumerate() {
+    for (i, &s) in sa.iter().enumerate() {
         if s == 0 { orig_idx = i as u32; }
         output.push(data[(s as usize + n - 1) % n]);
     }
@@ -779,12 +804,8 @@ pub fn compress(input: &[u8]) -> Vec<u8> {
     // Try LZ77 pipeline
     let lz77_result = lz77_compress(input);
     
-    // Try BWT pipeline (only for inputs that aren't too large — BWT is O(n log²n))
-    let bwt_result = if input.len() <= 2_000_000 {
-        bwt_compress(input)
-    } else {
-        Vec::new() // skip for very large inputs
-    };
+    // Try BWT pipeline (fast prefix-doubling radix sort)
+    let bwt_result = bwt_compress(input);
     
     // Pick the smaller result, prefixed with a mode byte
     let use_bwt = !bwt_result.is_empty() && bwt_result.len() < lz77_result.len();
