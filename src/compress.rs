@@ -834,32 +834,272 @@ fn lz77_compress(input: &[u8]) -> Vec<u8> {
     best
 }
 
-pub fn compress(input: &[u8]) -> Vec<u8> {
+
+// --- LZ77+BWT Hybrid: BWT on literal residuals, Huffman on matches ---
+
+fn lz77_bwt_hybrid_compress(input: &[u8]) -> Vec<u8> {
     if input.is_empty() { return Vec::new(); }
-    
-    // Try LZ77 pipeline
-    let lz77_result = lz77_compress(input);
-    
-    // Try BWT pipeline (only for inputs that aren't too large — BWT is O(n log²n))
-    let bwt_result = if input.len() <= 2_000_000 {
-        bwt_compress(input)
-    } else {
-        Vec::new() // skip for very large inputs
-    };
-    
-    // Pick the smaller result, prefixed with a mode byte
-    let use_bwt = !bwt_result.is_empty() && bwt_result.len() < lz77_result.len();
-    
+    let tokens = lz77_tokenize(input);
+    let mut literals = Vec::new();
+    let mut kind_bits_vec: Vec<u8> = Vec::new();
+    let mut match_lengths: Vec<usize> = Vec::new();
+    let mut match_offsets: Vec<usize> = Vec::new();
+    for t in &tokens {
+        match t {
+            Token::Literal(b) => { kind_bits_vec.push(0u8); literals.push(*b); }
+            Token::Match { length, offset } => {
+                kind_bits_vec.push(1u8);
+                match_lengths.push(*length);
+                match_offsets.push(*offset);
+            }
+        }
+    }
     let mut out = Vec::new();
-    if use_bwt {
-        out.push(1u8); // BWT mode
-        out.extend_from_slice(&bwt_result);
-    } else {
-        out.push(0u8); // LZ77 mode
-        out.extend_from_slice(&lz77_result);
+    out.extend_from_slice(&(input.len() as u32).to_le_bytes());
+    out.extend_from_slice(&(tokens.len() as u32).to_le_bytes());
+    out.extend_from_slice(&(literals.len() as u32).to_le_bytes());
+    out.extend_from_slice(&(match_lengths.len() as u32).to_le_bytes());
+    // 1. Kind stream
+    {
+        let mut bw = BitWriter::new();
+        for &k in &kind_bits_vec { bw.write_bits(k as u32, 1); }
+        let kbytes = bw.flush();
+        out.extend_from_slice(&(kbytes.len() as u32).to_le_bytes());
+        out.extend_from_slice(&kbytes);
+    }
+    // 2. Literals -> BWT -> MTF -> RLE -> adaptive range coder (same as bwt_compress)
+    {
+        if literals.is_empty() {
+            out.extend_from_slice(&0u32.to_le_bytes());
+        } else {
+            let bwt_block = 900_000usize;
+            let nblocks = (literals.len() + bwt_block - 1) / bwt_block;
+            let mut lbuf = Vec::new();
+            lbuf.extend_from_slice(&(nblocks as u32).to_le_bytes());
+            for chunk in literals.chunks(bwt_block) {
+                let (bwt_data, orig_idx) = bwt_forward(chunk);
+                let mtf_data = mtf_encode(&bwt_data);
+                let rle_data = rle_zero_encode(&mtf_data);
+                let mut model = RcModel::new(258);
+                let mut enc = RcEncoder::new();
+                for &s in &rle_data { enc.encode(&mut model, s as usize); }
+                enc.encode(&mut model, 257);
+                let encoded = enc.finish();
+                lbuf.extend_from_slice(&orig_idx.to_le_bytes());
+                lbuf.extend_from_slice(&(encoded.len() as u32).to_le_bytes());
+                lbuf.extend_from_slice(&encoded);
+            }
+            out.extend_from_slice(&(lbuf.len() as u32).to_le_bytes());
+            out.extend_from_slice(&lbuf);
+        }
+    }
+    // 3. Match lengths: Huffman
+    {
+        if match_lengths.is_empty() {
+            out.extend_from_slice(&0u32.to_le_bytes());
+        } else {
+            let mut lf = vec![0u32; 29];
+            for &l in &match_lengths { let (c, _, _) = length_to_code(l); lf[(c - 257) as usize] += 1; }
+            let ll = build_code_lengths(&lf, 15);
+            let lc = canonical_codes(&ll);
+            let lcc = ll.iter().rposition(|&l| l > 0).map(|p| p + 1).unwrap_or(0);
+            let mut me = Vec::new();
+            me.push(lcc as u8);
+            for ii in (0..lcc).step_by(2) {
+                let lo = ll[ii] & 0x0F;
+                let hi = if ii + 1 < lcc { ll[ii + 1] & 0x0F } else { 0 };
+                me.push(lo | (hi << 4));
+            }
+            let mut bw = BitWriter::new();
+            for &l in &match_lengths {
+                let (c, eb, ev) = length_to_code(l);
+                let (code, bits) = lc[(c - 257) as usize];
+                bw.write_bits(rev_bits(code, bits), bits as u32);
+                if eb > 0 { bw.write_bits(ev as u32, eb as u32); }
+            }
+            let lbytes = bw.flush();
+            me.extend_from_slice(&(lbytes.len() as u32).to_le_bytes());
+            me.extend_from_slice(&lbytes);
+            out.extend_from_slice(&(me.len() as u32).to_le_bytes());
+            out.extend_from_slice(&me);
+        }
+    }
+    // 4. Match distances: Huffman
+    {
+        if match_offsets.is_empty() {
+            out.extend_from_slice(&0u32.to_le_bytes());
+        } else {
+            let mut df = vec![0u32; 40];
+            for &o in &match_offsets { let (dc, _, _) = offset_to_code(o); df[dc as usize] += 1; }
+            let dl = build_code_lengths(&df, 15);
+            let dcc = canonical_codes(&dl);
+            let dcnt = dl.iter().rposition(|&l| l > 0).map(|p| p + 1).unwrap_or(0);
+            let mut de = Vec::new();
+            de.push(dcnt as u8);
+            for ii in (0..dcnt).step_by(2) {
+                let lo = dl[ii] & 0x0F;
+                let hi = if ii + 1 < dcnt { dl[ii + 1] & 0x0F } else { 0 };
+                de.push(lo | (hi << 4));
+            }
+            let mut bw = BitWriter::new();
+            for &o in &match_offsets {
+                let (c, eb, ev) = offset_to_code(o);
+                let (code, bits) = dcc[c as usize];
+                bw.write_bits(rev_bits(code, bits), bits as u32);
+                if eb > 0 { bw.write_bits(ev as u32, eb as u32); }
+            }
+            let dbytes = bw.flush();
+            de.extend_from_slice(&(dbytes.len() as u32).to_le_bytes());
+            de.extend_from_slice(&dbytes);
+            out.extend_from_slice(&(de.len() as u32).to_le_bytes());
+            out.extend_from_slice(&de);
+        }
     }
     out
 }
+
+fn lz77_bwt_hybrid_decompress(input: &[u8]) -> Vec<u8> {
+    if input.len() < 16 { return Vec::new(); }
+    let orig_size = u32::from_le_bytes([input[0], input[1], input[2], input[3]]) as usize;
+    let num_tokens = u32::from_le_bytes([input[4], input[5], input[6], input[7]]) as usize;
+    let num_literals = u32::from_le_bytes([input[8], input[9], input[10], input[11]]) as usize;
+    let num_matches = u32::from_le_bytes([input[12], input[13], input[14], input[15]]) as usize;
+    let mut pos = 16;
+    if pos + 4 > input.len() { return Vec::new(); }
+    let ks = u32::from_le_bytes([input[pos], input[pos+1], input[pos+2], input[pos+3]]) as usize; pos += 4;
+    if pos + ks > input.len() { return Vec::new(); }
+    let mut kr = BitReader::new(&input[pos..pos + ks]);
+    let mut kv = Vec::with_capacity(num_tokens);
+    for _ in 0..num_tokens { kv.push(kr.read_bits(1) as u8); }
+    pos += ks;
+    // Literals: BWT + MTF + RLE + range coder
+    if pos + 4 > input.len() { return Vec::new(); }
+    let ls = u32::from_le_bytes([input[pos], input[pos+1], input[pos+2], input[pos+3]]) as usize; pos += 4;
+    let literals = if ls == 0 { Vec::new() } else {
+        if pos + ls > input.len() { return Vec::new(); }
+        let ld = &input[pos..pos + ls]; pos += ls;
+        if ld.len() < 4 { return Vec::new(); }
+        let nb = u32::from_le_bytes([ld[0], ld[1], ld[2], ld[3]]) as usize;
+        let mut lp = 4;
+        let mut lits = Vec::with_capacity(num_literals);
+        for _ in 0..nb {
+            if lp + 8 > ld.len() { break; }
+            let oi = u32::from_le_bytes([ld[lp], ld[lp+1], ld[lp+2], ld[lp+3]]); lp += 4;
+            let es = u32::from_le_bytes([ld[lp], ld[lp+1], ld[lp+2], ld[lp+3]]) as usize; lp += 4;
+            if lp + es > ld.len() { break; }
+            let mut model = RcModel::new(258);
+            let mut dec = RcDecoder::new(&ld[lp..lp + es]); lp += es;
+            let mut rle_data: Vec<u16> = Vec::new();
+            loop {
+                let sym = dec.decode(&mut model);
+                if sym == 257 { break; }
+                if rle_data.len() > num_literals * 2 + 1000 { break; }
+                rle_data.push(sym as u16);
+            }
+            let mtf_data = rle_zero_decode(&rle_data);
+            let bwt_data = mtf_decode(&mtf_data);
+            let original = bwt_inverse(&bwt_data, oi);
+            lits.extend_from_slice(&original);
+        }
+        lits
+    };
+    // Match lengths
+    if pos + 4 > input.len() { return Vec::new(); }
+    let ms = u32::from_le_bytes([input[pos], input[pos+1], input[pos+2], input[pos+3]]) as usize; pos += 4;
+    let mls = if ms == 0 { Vec::new() } else {
+        if pos + ms > input.len() { return Vec::new(); }
+        let md = &input[pos..pos + ms]; pos += ms;
+        let mut mp = 0;
+        if mp >= md.len() { return Vec::new(); }
+        let lc = md[mp] as usize; mp += 1;
+        let pk = (lc + 1) / 2;
+        if mp + pk > md.len() { return Vec::new(); }
+        let mut ll = vec![0u8; 29];
+        for ii in 0..pk { let b = md[mp + ii]; let i0 = ii * 2;
+            if i0 < lc && i0 < 29 { ll[i0] = b & 0x0F; }
+            if i0 + 1 < lc && i0 + 1 < 29 { ll[i0 + 1] = b >> 4; }
+        }
+        mp += pk;
+        if mp + 4 > md.len() { return Vec::new(); }
+        let bs = u32::from_le_bytes([md[mp], md[mp+1], md[mp+2], md[mp+3]]) as usize; mp += 4;
+        if mp + bs > md.len() { return Vec::new(); }
+        let (st, lt, mx) = build_decode_table(&ll);
+        let mut r = BitReader::new(&md[mp..mp + bs]);
+        let mut v = Vec::with_capacity(num_matches);
+        for _ in 0..num_matches {
+            let c = decode_sym(&mut r, &st, &lt, mx) + 257;
+            let (bl, eb) = code_to_length_base(c);
+            let ex = if eb > 0 { r.read_bits(eb as u32) as usize } else { 0 };
+            v.push(bl + ex);
+        }
+        v
+    };
+    // Match distances
+    if pos + 4 > input.len() { return Vec::new(); }
+    let ds = u32::from_le_bytes([input[pos], input[pos+1], input[pos+2], input[pos+3]]) as usize; pos += 4;
+    let mos = if ds == 0 { Vec::new() } else {
+        if pos + ds > input.len() { return Vec::new(); }
+        let dd = &input[pos..pos + ds];
+        let mut dp = 0;
+        if dp >= dd.len() { return Vec::new(); }
+        let dc = dd[dp] as usize; dp += 1;
+        let pk = (dc + 1) / 2;
+        if dp + pk > dd.len() { return Vec::new(); }
+        let mut dl = vec![0u8; 40];
+        for ii in 0..pk { let b = dd[dp + ii]; let i0 = ii * 2;
+            if i0 < dc && i0 < 40 { dl[i0] = b & 0x0F; }
+            if i0 + 1 < dc && i0 + 1 < 40 { dl[i0 + 1] = b >> 4; }
+        }
+        dp += pk;
+        if dp + 4 > dd.len() { return Vec::new(); }
+        let bs = u32::from_le_bytes([dd[dp], dd[dp+1], dd[dp+2], dd[dp+3]]) as usize; dp += 4;
+        if dp + bs > dd.len() { return Vec::new(); }
+        let (st, lt, mx) = build_decode_table(&dl);
+        let mut r = BitReader::new(&dd[dp..dp + bs]);
+        let mut v = Vec::with_capacity(num_matches);
+        for _ in 0..num_matches {
+            let s = decode_sym(&mut r, &st, &lt, mx);
+            let (bd, eb) = code_to_offset_base(s as u8);
+            let ex = if eb > 0 { r.read_bits(eb as u32) as usize } else { 0 };
+            v.push(bd + ex);
+        }
+        v
+    };
+    let mut output = Vec::with_capacity(orig_size);
+    let mut li = 0; let mut mi = 0;
+    for &k in &kv {
+        if k == 0 { if li < literals.len() { output.push(literals[li]); li += 1; } }
+        else if mi < mls.len() && mi < mos.len() {
+            let len = mls[mi]; let off = mos[mi]; mi += 1;
+            if off == 0 || off > output.len() { break; }
+            let s = output.len() - off;
+            for j in 0..len { let b = output[s + j]; output.push(b); }
+        }
+    }
+    output
+}
+
+pub fn compress(input: &[u8]) -> Vec<u8> {
+    if input.is_empty() { return Vec::new(); }
+    
+    let lz77_result = lz77_compress(input);
+    let bwt_result = if input.len() <= 2_000_000 { bwt_compress(input) } else { Vec::new() };
+    let hybrid_result = lz77_bwt_hybrid_compress(input);
+    
+    let mut best_mode = 0u8;
+    let mut best_data = &lz77_result;
+    if !bwt_result.is_empty() && bwt_result.len() < best_data.len() {
+        best_mode = 1; best_data = &bwt_result;
+    }
+    if hybrid_result.len() < best_data.len() {
+        best_mode = 2; best_data = &hybrid_result;
+    }
+    let mut out = Vec::with_capacity(1 + best_data.len());
+    out.push(best_mode);
+    out.extend_from_slice(best_data);
+    out
+}
+
 
 // ─── Decompress ──────────────────────────────────────────────────────────
 
@@ -954,9 +1194,11 @@ pub fn decompress(input: &[u8]) -> Vec<u8> {
     let data = &input[1..];
     match mode {
         1 => bwt_decompress(data),
+        2 => lz77_bwt_hybrid_decompress(data),
         _ => lz77_decompress(data),
     }
 }
+
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
