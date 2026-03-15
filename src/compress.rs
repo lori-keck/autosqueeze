@@ -528,7 +528,12 @@ fn bwt_compress(input: &[u8]) -> Vec<u8> {
         out.extend_from_slice(&orig_idx.to_le_bytes());
         let count = lens.iter().rposition(|&l| l > 0).map(|p| p + 1).unwrap_or(0);
         out.extend_from_slice(&(count as u16).to_le_bytes());
-        out.extend_from_slice(&lens[..count]);
+        // Nibble-pack code lengths (4 bits each)
+        for ii in (0..count).step_by(2) {
+            let lo = lens[ii] & 0x0F;
+            let hi = if ii + 1 < count { lens[ii + 1] & 0x0F } else { 0 };
+            out.push(lo | (hi << 4));
+        }
         
         let mut bw = BitWriter::new();
         for &s in &rle_data {
@@ -557,9 +562,19 @@ fn bwt_decompress(input: &[u8]) -> Vec<u8> {
         
         if pos + 2 > input.len() { break; }
         let count = u16::from_le_bytes([input[pos], input[pos+1]]) as usize; pos += 2;
-        if pos + count > input.len() { break; }
+        let _count_for_check = (count + 1) / 2;
+        if pos + _count_for_check > input.len() { break; }
         let mut lens = vec![0u8; 258];
-        lens[..count].copy_from_slice(&input[pos..pos+count]); pos += count;
+        let pk = (count + 1) / 2;
+        // Unpack nibble-packed code lengths
+        for ii in 0..pk {
+            if pos + ii >= input.len() { break; }
+            let byte = input[pos + ii];
+            let idx0 = ii * 2;
+            if idx0 < count { lens[idx0] = byte & 0x0F; }
+            if idx0 + 1 < count { lens[idx0 + 1] = byte >> 4; }
+        }
+        pos += pk;
         
         if pos + 4 > input.len() { break; }
         let bds = u32::from_le_bytes([input[pos], input[pos+1], input[pos+2], input[pos+3]]) as usize; pos += 4;
@@ -690,10 +705,19 @@ fn encode_block(tokens: &[Token], out: &mut Vec<u8>) {
 
     let ll_count = ll_lens.iter().rposition(|&l| l > 0).map(|p| p + 1).unwrap_or(0);
     out.extend_from_slice(&(ll_count as u16).to_le_bytes());
-    out.extend_from_slice(&ll_lens[..ll_count]);
+    // Nibble-pack code lengths
+    for ii in (0..ll_count).step_by(2) {
+        let lo = ll_lens[ii] & 0x0F;
+        let hi = if ii + 1 < ll_count { ll_lens[ii + 1] & 0x0F } else { 0 };
+        out.push(lo | (hi << 4));
+    }
     let d_count = d_lens.iter().rposition(|&l| l > 0).map(|p| p + 1).unwrap_or(0);
     out.push(d_count as u8);
-    out.extend_from_slice(&d_lens[..d_count]);
+    for ii in (0..d_count).step_by(2) {
+        let lo = d_lens[ii] & 0x0F;
+        let hi = if ii + 1 < d_count { d_lens[ii + 1] & 0x0F } else { 0 };
+        out.push(lo | (hi << 4));
+    }
 
     let mut bw = BitWriter::new();
     let mut prev_lit2 = 0u8;
@@ -792,15 +816,31 @@ fn lz77_decompress(input: &[u8]) -> Vec<u8> {
 
         if pos + 2 > input.len() { break; }
         let ll_count = u16::from_le_bytes([input[pos], input[pos + 1]]) as usize; pos += 2;
-        if pos + ll_count > input.len() { break; }
+        if pos + (ll_count + 1) / 2 > input.len() { break; }
         let mut ll_lens = vec![0u8; 286];
-        ll_lens[..ll_count].copy_from_slice(&input[pos..pos + ll_count]); pos += ll_count;
+        let ll_pk = (ll_count + 1) / 2;
+        for ii in 0..ll_pk {
+            if pos + ii >= input.len() { break; }
+            let byte = input[pos + ii];
+            let idx0 = ii * 2;
+            if idx0 < ll_count { ll_lens[idx0] = byte & 0x0F; }
+            if idx0 + 1 < ll_count { ll_lens[idx0 + 1] = byte >> 4; }
+        }
+        pos += ll_pk;
 
         if pos >= input.len() { break; }
         let d_count = input[pos] as usize; pos += 1;
-        if pos + d_count > input.len() { break; }
+        if pos + (d_count + 1) / 2 > input.len() { break; }
         let mut d_lens = vec![0u8; 40];
-        d_lens[..d_count].copy_from_slice(&input[pos..pos + d_count]); pos += d_count;
+        let d_pk = (d_count + 1) / 2;
+        for ii in 0..d_pk {
+            if pos + ii >= input.len() { break; }
+            let byte = input[pos + ii];
+            let idx0 = ii * 2;
+            if idx0 < d_count { d_lens[idx0] = byte & 0x0F; }
+            if idx0 + 1 < d_count { d_lens[idx0 + 1] = byte >> 4; }
+        }
+        pos += d_pk;
 
         if pos + 4 > input.len() { break; }
         let bds = u32::from_le_bytes([input[pos], input[pos+1], input[pos+2], input[pos+3]]) as usize; pos += 4;
