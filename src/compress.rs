@@ -840,25 +840,163 @@ pub fn compress(input: &[u8]) -> Vec<u8> {
     // Try LZ77 pipeline
     let lz77_result = lz77_compress(input);
     
-    // Try BWT pipeline (only for inputs that aren't too large — BWT is O(n log²n))
+    // Try BWT pipeline
     let bwt_result = if input.len() <= 2_000_000 {
         bwt_compress(input)
     } else {
-        Vec::new() // skip for very large inputs
+        Vec::new()
     };
     
-    // Pick the smaller result, prefixed with a mode byte
-    let use_bwt = !bwt_result.is_empty() && bwt_result.len() < lz77_result.len();
+    // Try LZW pipeline
+    let lzw_result = lzw_compress(input);
     
-    let mut out = Vec::new();
-    if use_bwt {
-        out.push(1u8); // BWT mode
-        out.extend_from_slice(&bwt_result);
-    } else {
-        out.push(0u8); // LZ77 mode
-        out.extend_from_slice(&lz77_result);
+    // Pick the smallest result, prefixed with a mode byte
+    let mut best = &lz77_result;
+    let mut best_mode = 0u8;
+    if !bwt_result.is_empty() && bwt_result.len() < best.len() {
+        best = &bwt_result;
+        best_mode = 1;
     }
+    if lzw_result.len() < best.len() {
+        best = &lzw_result;
+        best_mode = 2;
+    }
+    let mut out = Vec::with_capacity(1 + best.len());
+    out.push(best_mode);
+    out.extend_from_slice(best);
     out
+}
+
+
+// --------- LZW Compression ---------
+
+const LZW_MAX_TABLE: usize = 1 << 16;
+const LZW_CLEAR_CODE: u16 = 256;
+const LZW_FIRST_CODE: u16 = 258;
+
+fn lzw_compress(input: &[u8]) -> Vec<u8> {
+    if input.is_empty() { return Vec::new(); }
+    let codes = lzw_encode_to_codes(input);
+    let max_code_val = codes.iter().copied().max().unwrap_or(0) as usize;
+    let total_syms = max_code_val + 2;
+    let eob_sym = total_syms - 1;
+    let mut freq = vec![0u32; total_syms];
+    for &c in &codes { freq[c as usize] += 1; }
+    freq[eob_sym] = 1;
+    let lens = build_code_lengths(&freq, 15);
+    let huff_codes = canonical_codes(&lens);
+    let mut out = Vec::new();
+    out.extend_from_slice(&(input.len() as u32).to_le_bytes());
+    out.extend_from_slice(&(total_syms as u16).to_le_bytes());
+    for ii in (0..total_syms).step_by(2) {
+        let lo = lens[ii] & 0x0F;
+        let hi = if ii + 1 < total_syms { lens[ii + 1] & 0x0F } else { 0 };
+        out.push(lo | (hi << 4));
+    }
+    let mut bw = BitWriter::new();
+    for &c in &codes {
+        let (code, bits) = huff_codes[c as usize];
+        bw.write_bits(rev_bits(code, bits), bits as u32);
+    }
+    let (eob_code, eob_bits) = huff_codes[eob_sym];
+    bw.write_bits(rev_bits(eob_code, eob_bits), eob_bits as u32);
+    let bits_data = bw.flush();
+    out.extend_from_slice(&(bits_data.len() as u32).to_le_bytes());
+    out.extend_from_slice(&bits_data);
+    out
+}
+
+fn lzw_encode_to_codes(input: &[u8]) -> Vec<u16> {
+    let mut codes = Vec::new();
+    let mut dict: std::collections::HashMap<(u16, u8), u16> = std::collections::HashMap::new();
+    let mut next_code: u16 = LZW_FIRST_CODE;
+    let mut w: u16 = input[0] as u16;
+    for &byte in &input[1..] {
+        if let Some(&code) = dict.get(&(w, byte)) {
+            w = code;
+        } else {
+            codes.push(w);
+            if (next_code as usize) < LZW_MAX_TABLE {
+                dict.insert((w, byte), next_code);
+                next_code += 1;
+            } else {
+                dict.clear();
+                next_code = LZW_FIRST_CODE;
+                codes.push(LZW_CLEAR_CODE);
+            }
+            w = byte as u16;
+        }
+    }
+    codes.push(w);
+    codes
+}
+
+fn lzw_decompress(input: &[u8]) -> Vec<u8> {
+    if input.len() < 6 { return Vec::new(); }
+    let orig_size = u32::from_le_bytes([input[0], input[1], input[2], input[3]]) as usize;
+    let total_syms = u16::from_le_bytes([input[4], input[5]]) as usize;
+    let mut pos = 6;
+    let pk = (total_syms + 1) / 2;
+    if pos + pk > input.len() { return Vec::new(); }
+    let mut lens = vec![0u8; total_syms];
+    for ii in 0..pk {
+        let byte = input[pos + ii];
+        let idx0 = ii * 2;
+        if idx0 < total_syms { lens[idx0] = byte & 0x0F; }
+        if idx0 + 1 < total_syms { lens[idx0 + 1] = byte >> 4; }
+    }
+    pos += pk;
+    if pos + 4 > input.len() { return Vec::new(); }
+    let bds = u32::from_le_bytes([input[pos], input[pos+1], input[pos+2], input[pos+3]]) as usize;
+    pos += 4;
+    if pos + bds > input.len() { return Vec::new(); }
+    let (sym_table, len_table, max_bits) = build_decode_table(&lens);
+    let mut reader = BitReader::new(&input[pos..pos + bds]);
+    let eob_sym = total_syms - 1;
+    let mut codes = Vec::new();
+    loop {
+        let sym = decode_sym(&mut reader, &sym_table, &len_table, max_bits) as usize;
+        if sym == eob_sym { break; }
+        codes.push(sym as u16);
+    }
+    lzw_decode_from_codes(&codes, orig_size)
+}
+
+fn lzw_decode_from_codes(codes: &[u16], orig_size: usize) -> Vec<u8> {
+    if codes.is_empty() { return Vec::new(); }
+    let mut dict: Vec<Vec<u8>> = Vec::with_capacity(LZW_MAX_TABLE);
+    for i in 0..256 { dict.push(vec![i as u8]); }
+    dict.push(Vec::new()); // 256 = clear
+    dict.push(Vec::new()); // 257 = placeholder
+    let mut output = Vec::with_capacity(orig_size);
+    let mut prev: Option<Vec<u8>> = None;
+    for &code in codes {
+        if code == LZW_CLEAR_CODE {
+            dict.truncate(LZW_FIRST_CODE as usize);
+            prev = None;
+            continue;
+        }
+        let entry = if (code as usize) < dict.len() {
+            dict[code as usize].clone()
+        } else if code as usize == dict.len() {
+            if let Some(ref p) = prev {
+                let mut e = p.clone();
+                e.push(p[0]);
+                e
+            } else { return Vec::new(); }
+        } else { return Vec::new(); };
+        output.extend_from_slice(&entry);
+        if let Some(ref p) = prev {
+            if dict.len() < LZW_MAX_TABLE {
+                let mut new_entry = p.clone();
+                new_entry.push(entry[0]);
+                dict.push(new_entry);
+            }
+        }
+        prev = Some(entry);
+    }
+    output.truncate(orig_size);
+    output
 }
 
 // ─── Decompress ──────────────────────────────────────────────────────────
@@ -954,6 +1092,7 @@ pub fn decompress(input: &[u8]) -> Vec<u8> {
     let data = &input[1..];
     match mode {
         1 => bwt_decompress(data),
+        2 => lzw_decompress(data),
         _ => lz77_decompress(data),
     }
 }
