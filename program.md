@@ -24,6 +24,7 @@ WORKTREE="/tmp/autosqueeze-${BRANCH##*/}"
 cd "$REPO" && git fetch origin main
 git worktree add "$WORKTREE" -b "$BRANCH" origin/main
 cd "$WORKTREE"
+ln -s "$REPO/corpus" "$WORKTREE/corpus"
 ```
 
 Then do ALL your work inside `$WORKTREE`. Never `cd` back to the main repo.
