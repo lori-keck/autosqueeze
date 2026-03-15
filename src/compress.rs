@@ -834,31 +834,138 @@ fn lz77_compress(input: &[u8]) -> Vec<u8> {
     best
 }
 
+// ─── RLE Preprocessing ───────────────────────────────────────────────────
+
+/// Find the least frequent byte in the input to use as escape
+fn find_escape_byte(input: &[u8]) -> u8 {
+    let mut freq = [0u32; 256];
+    for &b in input { freq[b as usize] += 1; }
+    let mut best = 0u8;
+    let mut best_freq = u32::MAX;
+    for i in 0..256 {
+        if freq[i] < best_freq { best_freq = freq[i]; best = i as u8; }
+    }
+    best
+}
+
+/// RLE prepass: encode runs of >=4 identical bytes as [escape][byte][count-4]
+/// Escape byte itself is always emitted as [escape][escape] per literal (never run-encoded)
+/// This avoids ambiguity since escape is the least frequent byte.
+fn rle_prepass_encode(input: &[u8]) -> Vec<u8> {
+    if input.is_empty() { return Vec::new(); }
+    let escape = find_escape_byte(input);
+    let mut out = Vec::with_capacity(input.len());
+    out.push(escape);
+    let mut i = 0;
+    while i < input.len() {
+        let b = input[i];
+        let mut run = 1;
+        while i + run < input.len() && input[i + run] == b { run += 1; }
+        if b == escape {
+            // Never run-encode the escape byte (avoids ambiguity)
+            for _ in 0..run { out.push(escape); out.push(escape); }
+            i += run;
+        } else if run >= 4 {
+            let mut remaining = run;
+            while remaining >= 4 {
+                let chunk = remaining.min(259);
+                out.push(escape);
+                out.push(b);
+                out.push((chunk - 4) as u8);
+                remaining -= chunk;
+            }
+            for _ in 0..remaining { out.push(b); }
+            i += run;
+        } else {
+            for _ in 0..run { out.push(b); i += 1; }
+        }
+    }
+    out
+}
+
+fn rle_prepass_decode(input: &[u8]) -> Vec<u8> {
+    if input.is_empty() { return Vec::new(); }
+    let escape = input[0];
+    let mut out = Vec::with_capacity(input.len());
+    let mut i = 1;
+    while i < input.len() {
+        if input[i] == escape {
+            i += 1;
+            if i >= input.len() { break; }
+            let b = input[i]; i += 1;
+            if b == escape {
+                // Literal escape byte
+                out.push(escape);
+            } else {
+                // Run: byte + count
+                if i >= input.len() { break; }
+                let count = input[i] as usize + 4; i += 1;
+                for _ in 0..count { out.push(b); }
+            }
+        } else {
+            out.push(input[i]);
+            i += 1;
+        }
+    }
+    out
+}
+
+/// Quick check: would RLE prepass shrink the data? (>=2% bytes in runs of >=4)
+fn rle_prepass_would_help(input: &[u8]) -> bool {
+    if input.len() < 100 { return false; }
+    let mut run_bytes = 0usize;
+    let mut i = 0;
+    while i < input.len() {
+        let b = input[i];
+        let mut run = 1;
+        while i + run < input.len() && input[i + run] == b { run += 1; }
+        if run >= 4 { run_bytes += run; }
+        i += run;
+    }
+    run_bytes * 50 > input.len()
+}
+
 pub fn compress(input: &[u8]) -> Vec<u8> {
     if input.is_empty() { return Vec::new(); }
     
     // Try LZ77 pipeline
     let lz77_result = lz77_compress(input);
     
-    // Try BWT pipeline (only for inputs that aren't too large — BWT is O(n log²n))
+    // Try BWT pipeline
     let bwt_result = if input.len() <= 2_000_000 {
         bwt_compress(input)
     } else {
-        Vec::new() // skip for very large inputs
+        Vec::new()
     };
     
-    // Pick the smaller result, prefixed with a mode byte
+    // Pick best base mode (0=LZ77, 1=BWT)
     let use_bwt = !bwt_result.is_empty() && bwt_result.len() < lz77_result.len();
+    let (base_mode, base_ref) = if use_bwt { (1u8, &bwt_result) } else { (0u8, &lz77_result) };
+    let base_size = 1 + base_ref.len();
     
-    let mut out = Vec::new();
-    if use_bwt {
-        out.push(1u8); // BWT mode
-        out.extend_from_slice(&bwt_result);
-    } else {
-        out.push(0u8); // LZ77 mode
-        out.extend_from_slice(&lz77_result);
+    let mut best_out = Vec::with_capacity(base_size);
+    best_out.push(base_mode);
+    best_out.extend_from_slice(base_ref);
+    
+    // Mode 2: RLE prepass → best compressor
+    if rle_prepass_would_help(input) {
+        let rle_data = rle_prepass_encode(input);
+        if rle_data.len() < input.len() {
+            let rle_lz77 = lz77_compress(&rle_data);
+            let rle_bwt = if rle_data.len() <= 2_000_000 { bwt_compress(&rle_data) } else { Vec::new() };
+            let rle_use_bwt = !rle_bwt.is_empty() && rle_bwt.len() < rle_lz77.len();
+            let (inner_mode, inner_ref) = if rle_use_bwt { (1u8, &rle_bwt) } else { (0u8, &rle_lz77) };
+            let rle_total = 2 + inner_ref.len();
+            if rle_total < base_size {
+                best_out.clear();
+                best_out.push(2u8); // RLE prepass mode
+                best_out.push(inner_mode);
+                best_out.extend_from_slice(inner_ref);
+            }
+        }
     }
-    out
+    
+    best_out
 }
 
 // ─── Decompress ──────────────────────────────────────────────────────────
@@ -954,6 +1061,17 @@ pub fn decompress(input: &[u8]) -> Vec<u8> {
     let data = &input[1..];
     match mode {
         1 => bwt_decompress(data),
+        2 => {
+            // RLE prepass: data[0]=inner_mode, data[1..]=compressed(rle_encoded)
+            if data.is_empty() { return Vec::new(); }
+            let inner_mode = data[0];
+            let inner_data = &data[1..];
+            let rle_encoded = match inner_mode {
+                1 => bwt_decompress(inner_data),
+                _ => lz77_decompress(inner_data),
+            };
+            rle_prepass_decode(&rle_encoded)
+        }
         _ => lz77_decompress(data),
     }
 }
@@ -1049,4 +1167,34 @@ mod tests {
         assert_eq!(d.len(), input.len());
         assert_eq!(d, input);
     }
+
+    #[test]
+    fn test_rle_prepass_roundtrip() {
+        let data = b"aaaa    bbbb    cccc    dddd";
+        let encoded = rle_prepass_encode(data);
+        let decoded = rle_prepass_decode(&encoded);
+        assert_eq!(decoded, data);
+    }
+
+    #[test]
+    fn test_rle_prepass_all_bytes() {
+        let mut data = Vec::new();
+        for i in 0..256u16 { for _ in 0..5 { data.push(i as u8); } }
+        let encoded = rle_prepass_encode(&data);
+        let decoded = rle_prepass_decode(&encoded);
+        assert_eq!(decoded, data);
+    }
+
+    #[test]
+    fn test_rle_prepass_long_runs() {
+        let mut data = Vec::new();
+        data.extend(vec![0x20u8; 1000]);
+        data.extend(b"hello world");
+        data.extend(vec![0x0Au8; 500]);
+        let encoded = rle_prepass_encode(&data);
+        let decoded = rle_prepass_decode(&encoded);
+        assert_eq!(decoded, data);
+        assert!(encoded.len() < data.len()); // should compress
+    }
+
 }
