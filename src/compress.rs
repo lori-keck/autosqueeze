@@ -202,28 +202,55 @@ fn lz77_tokenize(input: &[u8]) -> Vec<Token> {
         chain.insert(input, pos);
     }
 
-    // DP backward pass
-    let mut cost = vec![u32::MAX / 2; n + 1];
+    // Iterative DP: converge cost estimates over 2 iterations
+    let mut ll_lens = vec![8u8; 286];
+    let mut d_lens = vec![5u8; 40];
     let mut choice: Vec<(usize, usize)> = vec![(1, 0); n + 1];
-    cost[n] = 0;
-
-    for pos in (0..n).rev() {
-        let c = 9u32 + cost[pos + 1];
-        if c < cost[pos] { cost[pos] = c; choice[pos] = (1, 0); }
-        for &(len, off) in &all_matches[pos] {
-            let (_, leb, _) = length_to_code(len);
-            let (_, deb, _) = offset_to_code(off);
-            let mc = 7u32 + leb as u32 + 5 + deb as u32 + cost[pos + len];
-            if mc < cost[pos] { cost[pos] = mc; choice[pos] = (len, off); }
-            // Try some shorter lengths
-            for &sl in &[MIN_MATCH, 4, 5, 6, 8, 12, 16, 24, 32, len/2] {
-                if sl >= MIN_MATCH && sl < len {
-                    let (_, leb, _) = length_to_code(sl);
-                    let mc = 7u32 + leb as u32 + 5 + deb as u32 + cost[pos + sl];
-                    if mc < cost[pos] { cost[pos] = mc; choice[pos] = (sl, off); }
+    for _iter in 0..2 {
+        let mut cost = vec![u32::MAX / 2; n + 1];
+        choice = vec![(1, 0); n + 1];
+        cost[n] = 0;
+        for pos in (0..n).rev() {
+            let lb = ll_lens[input[pos] as usize];
+            let lc = (if lb == 0 { 15 } else { lb as u32 }) + cost[pos + 1];
+            if lc < cost[pos] { cost[pos] = lc; choice[pos] = (1, 0); }
+            for &(len, off) in &all_matches[pos] {
+                let (lcode, leb, _) = length_to_code(len);
+                let ll = ll_lens[lcode as usize];
+                let ll_c = if ll == 0 { 15 } else { ll as u32 };
+                let (dcode, deb, _) = offset_to_code(off);
+                let dl = d_lens[dcode as usize];
+                let dl_c = if dl == 0 { 15 } else { dl as u32 };
+                let mc = ll_c + leb as u32 + dl_c + deb as u32 + cost[pos + len];
+                if mc < cost[pos] { cost[pos] = mc; choice[pos] = (len, off); }
+                for &sl in &[3,4,5,6,7,8,9,10,11,13,15,17,19,23,27,31,35,43,51,67,83,99,115,131] {
+                    if sl >= MIN_MATCH && sl < len {
+                        let (slc, sleb, _) = length_to_code(sl);
+                        let sll = ll_lens[slc as usize];
+                        let sll_c = if sll == 0 { 15 } else { sll as u32 };
+                        let smc = sll_c + sleb as u32 + dl_c + deb as u32 + cost[pos + sl];
+                        if smc < cost[pos] { cost[pos] = smc; choice[pos] = (sl, off); }
+                    }
                 }
             }
         }
+        let mut ll_freq = vec![1u32; 286];
+        let mut d_freq = vec![1u32; 40];
+        let mut p = 0;
+        while p < n {
+            let (len, off) = choice[p];
+            if off == 0 { ll_freq[input[p] as usize] += 1; p += 1; }
+            else {
+                let (lc, _, _) = length_to_code(len);
+                ll_freq[lc as usize] += 1;
+                let (dc, _, _) = offset_to_code(off);
+                d_freq[dc as usize] += 1;
+                p += len;
+            }
+        }
+        ll_freq[256] += 1;
+        ll_lens = build_code_lengths(&ll_freq, 15);
+        d_lens = build_code_lengths(&d_freq, 15);
     }
 
     let mut tokens = Vec::new();
@@ -600,7 +627,7 @@ impl<'a> RcDecoder<'a> {
 /// BWT pipeline: BWT → MTF → RLE → adaptive range coding (no headers needed)
 fn bwt_compress(input: &[u8]) -> Vec<u8> {
     if input.is_empty() { return Vec::new(); }
-    let bwt_block_size = 900_000usize;
+    let bwt_block_size = 1_500_000usize;
     let mut out = Vec::new();
     out.extend_from_slice(&(input.len() as u32).to_le_bytes());
     let num_blocks = (input.len() + bwt_block_size - 1) / bwt_block_size;
