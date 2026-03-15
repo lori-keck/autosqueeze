@@ -11,10 +11,10 @@
 
 use std::io::{self, Read, Write};
 
-const WINDOW_SIZE: usize = 1048576; // 1MB window
+const WINDOW_SIZE: usize = 262144; // 256KB window
 const MIN_MATCH: usize = 3;
 const MAX_MATCH: usize = 258;
-const HASH_CHAIN_LIMIT: usize = 512;
+const HASH_CHAIN_LIMIT: usize = 64;
 const BLOCK_SIZE: usize = 32768;
 
 // ─── DEFLATE length/distance tables ──────────────────────────────────────
@@ -172,6 +172,9 @@ impl HashChain {
         while cp >= 0 && (cp as usize) >= min_p && count < HASH_CHAIN_LIMIT {
             let c = cp as usize;
             if c < pos {
+                if best_len >= MIN_MATCH && best_len < max_l && data[c + best_len] != data[pos + best_len] {
+                    cp = self.prev[c % WINDOW_SIZE]; count += 1; continue;
+                }
                 let mut l = 0;
                 while l < max_l && data[c + l] == data[pos + l] { l += 1; }
                 if l > best_len {
@@ -195,43 +198,38 @@ fn lz77_tokenize(input: &[u8]) -> Vec<Token> {
     if input.is_empty() { return Vec::new(); }
     let n = input.len();
     let mut chain = HashChain::new();
-
-    let mut all_matches: Vec<Vec<(usize, usize)>> = vec![Vec::new(); n];
-    for pos in 0..n {
-        all_matches[pos] = chain.find_matches(input, pos);
-        chain.insert(input, pos);
-    }
-
-    // DP backward pass
-    let mut cost = vec![u32::MAX / 2; n + 1];
-    let mut choice: Vec<(usize, usize)> = vec![(1, 0); n + 1];
-    cost[n] = 0;
-
-    for pos in (0..n).rev() {
-        let c = 9u32 + cost[pos + 1];
-        if c < cost[pos] { cost[pos] = c; choice[pos] = (1, 0); }
-        for &(len, off) in &all_matches[pos] {
-            let (_, leb, _) = length_to_code(len);
-            let (_, deb, _) = offset_to_code(off);
-            let mc = 7u32 + leb as u32 + 5 + deb as u32 + cost[pos + len];
-            if mc < cost[pos] { cost[pos] = mc; choice[pos] = (len, off); }
-            // Try some shorter lengths
-            for &sl in &[MIN_MATCH, 4, 5, 6, 8, 12, 16, 24, 32, len/2] {
-                if sl >= MIN_MATCH && sl < len {
-                    let (_, leb, _) = length_to_code(sl);
-                    let mc = 7u32 + leb as u32 + 5 + deb as u32 + cost[pos + sl];
-                    if mc < cost[pos] { cost[pos] = mc; choice[pos] = (sl, off); }
-                }
-            }
-        }
-    }
-
     let mut tokens = Vec::new();
     let mut pos = 0;
     while pos < n {
-        let (len, off) = choice[pos];
-        if off == 0 { tokens.push(Token::Literal(input[pos])); pos += 1; }
-        else { tokens.push(Token::Match { length: len, offset: off }); pos += len; }
+        let matches = chain.find_matches(input, pos);
+        let mut best_len = 0usize;
+        let mut best_off = 0usize;
+        for &(len, off) in &matches {
+            if len > best_len || (len == best_len && off < best_off) {
+                best_len = len; best_off = off;
+            }
+        }
+        if best_len >= MIN_MATCH {
+            chain.insert(input, pos);
+            if pos + 1 < n && best_len < MAX_MATCH {
+                let nm = chain.find_matches(input, pos + 1);
+                let mut nb = 0usize;
+                for &(l, _) in &nm { if l > nb { nb = l; } }
+                if nb > best_len + 1 {
+                    tokens.push(Token::Literal(input[pos]));
+                    pos += 1;
+                    continue;
+                }
+            }
+            tokens.push(Token::Match { length: best_len, offset: best_off });
+            let ic = best_len.min(4);
+            for i in 1..ic { if pos + i < n { chain.insert(input, pos + i); } }
+            pos += best_len;
+        } else {
+            chain.insert(input, pos);
+            tokens.push(Token::Literal(input[pos]));
+            pos += 1;
+        }
     }
     tokens
 }
@@ -506,7 +504,7 @@ fn rle_zero_decode(data: &[u16]) -> Vec<u8> {
 /// BWT pipeline: BWT → MTF → RLE → Huffman encode
 fn bwt_compress(input: &[u8]) -> Vec<u8> {
     if input.is_empty() { return Vec::new(); }
-    let bwt_block_size = 900_000usize; // bzip2-style large blocks
+    let bwt_block_size = 100_000usize; // bzip2-style large blocks
     let mut out = Vec::new();
     out.extend_from_slice(&(input.len() as u32).to_le_bytes());
     let num_blocks = (input.len() + bwt_block_size - 1) / bwt_block_size;
@@ -780,7 +778,7 @@ pub fn compress(input: &[u8]) -> Vec<u8> {
     let lz77_result = lz77_compress(input);
     
     // Try BWT pipeline (only for inputs that aren't too large — BWT is O(n log²n))
-    let bwt_result = if input.len() <= 2_000_000 {
+    let bwt_result = if input.len() <= 500_000 {
         bwt_compress(input)
     } else {
         Vec::new() // skip for very large inputs
