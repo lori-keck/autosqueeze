@@ -10,6 +10,29 @@ You are an autonomous research agent. Your goal is to discover and implement nov
 - `src/benchmark.rs` — **DO NOT EDIT.** Measures compression ratio, speed, and correctness.
 - `corpus/` — Test files of various types (text, binary, structured data). **DO NOT EDIT.**
 
+## IMPORTANT: Isolated Worktree Setup
+
+**Multiple agents run in parallel.** You MUST use a git worktree to avoid collisions.
+
+At the start of your session, run these commands EXACTLY:
+
+```bash
+REPO=/Users/lorikeck/github/autosqueeze
+BRANCH="experiment/$(echo $RANDOM$RANDOM | head -c 8)"
+WORKTREE="/tmp/autosqueeze-${BRANCH##*/}"
+
+cd "$REPO" && git fetch origin main
+git worktree add "$WORKTREE" -b "$BRANCH" origin/main
+cd "$WORKTREE"
+```
+
+Then do ALL your work inside `$WORKTREE`. Never `cd` back to the main repo.
+
+When you're done and have pushed:
+```bash
+cd /tmp && git -C "$REPO" worktree remove "$WORKTREE" 2>/dev/null
+```
+
 ## The Loop
 
 For each experiment:
