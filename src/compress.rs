@@ -215,11 +215,11 @@ fn lz77_tokenize(input: &[u8]) -> Vec<Token> {
             let (_, deb, _) = offset_to_code(off);
             let mc = 7u32 + leb as u32 + 5 + deb as u32 + cost[pos + len];
             if mc < cost[pos] { cost[pos] = mc; choice[pos] = (len, off); }
-            // Try some shorter lengths
-            for &sl in &[MIN_MATCH, 4, 5, 6, 8, 12, 16, 24, 32, len/2] {
+            // Try all shorter lengths at key boundaries (where extra bits change)
+            for &sl in &[3,4,5,6,7,8,9,10,11,13,15,17,19,23,27,31,35,43,51,59,67,83,99,115,131,163,195,227,258] {
                 if sl >= MIN_MATCH && sl < len {
-                    let (_, leb, _) = length_to_code(sl);
-                    let mc = 7u32 + leb as u32 + 5 + deb as u32 + cost[pos + sl];
+                    let (_, leb2, _) = length_to_code(sl);
+                    let mc = 7u32 + leb2 as u32 + 5 + deb as u32 + cost[pos + sl];
                     if mc < cost[pos] { cost[pos] = mc; choice[pos] = (sl, off); }
                 }
             }
