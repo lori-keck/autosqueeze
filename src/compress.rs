@@ -14,7 +14,7 @@ use std::io::{self, Read, Write};
 const WINDOW_SIZE: usize = 1048576; // 1MB window
 const MIN_MATCH: usize = 3;
 const MAX_MATCH: usize = 258;
-const HASH_CHAIN_LIMIT: usize = 128;
+const HASH_CHAIN_LIMIT: usize = 512;
 const BLOCK_SIZE: usize = 32768;
 
 // ─── DEFLATE length/distance tables ──────────────────────────────────────
@@ -383,6 +383,208 @@ fn decode_sym(reader: &mut BitReader, sym_table: &[u16], len_table: &[u8], max_b
     sym
 }
 
+// ─── BWT (Burrows-Wheeler Transform) ─────────────────────────────────────
+
+fn bwt_forward(data: &[u8]) -> (Vec<u8>, u32) {
+    let n = data.len();
+    if n == 0 { return (Vec::new(), 0); }
+    // Sort rotation indices using cyclic comparison
+    let mut indices: Vec<u32> = (0..n as u32).collect();
+    // Use radix + merge sort approach for speed
+    indices.sort_unstable_by(|&a, &b| {
+        let a = a as usize;
+        let b = b as usize;
+        // Compare up to n bytes cyclically
+        let mut i = 0;
+        while i < n {
+            // Compare in chunks for speed
+            let ca = data[(a + i) % n];
+            let cb = data[(b + i) % n];
+            if ca != cb { return ca.cmp(&cb); }
+            i += 1;
+        }
+        std::cmp::Ordering::Equal
+    });
+    let mut output = Vec::with_capacity(n);
+    let mut orig_idx = 0u32;
+    for (i, &s) in indices.iter().enumerate() {
+        if s == 0 { orig_idx = i as u32; }
+        output.push(data[(s as usize + n - 1) % n]);
+    }
+    (output, orig_idx)
+}
+
+fn bwt_inverse(bwt: &[u8], orig_idx: u32) -> Vec<u8> {
+    let n = bwt.len();
+    if n == 0 { return Vec::new(); }
+    let mut count = [0usize; 256];
+    for &b in bwt { count[b as usize] += 1; }
+    let mut cumul = [0usize; 256];
+    let mut sum = 0;
+    for i in 0..256 { cumul[i] = sum; sum += count[i]; }
+    let mut t = vec![0usize; n];
+    let mut c = cumul;
+    for i in 0..n { let b = bwt[i] as usize; t[i] = c[b]; c[b] += 1; }
+    let mut output = vec![0u8; n];
+    let mut idx = orig_idx as usize;
+    for i in (0..n).rev() { output[i] = bwt[idx]; idx = t[idx]; }
+    output
+}
+
+fn mtf_encode(data: &[u8]) -> Vec<u8> {
+    let mut list = [0u8; 256];
+    for i in 0..256 { list[i] = i as u8; }
+    let mut out = Vec::with_capacity(data.len());
+    for &b in data {
+        let pos = list.iter().position(|&x| x == b).unwrap_or(0);
+        out.push(pos as u8);
+        for i in (1..=pos).rev() { list[i] = list[i - 1]; }
+        list[0] = b;
+    }
+    out
+}
+
+fn mtf_decode(data: &[u8]) -> Vec<u8> {
+    let mut list = [0u8; 256];
+    for i in 0..256 { list[i] = i as u8; }
+    let mut out = Vec::with_capacity(data.len());
+    for &pos in data {
+        let b = list[pos as usize];
+        out.push(b);
+        for i in (1..=pos as usize).rev() { list[i] = list[i - 1]; }
+        list[0] = b;
+    }
+    out
+}
+
+/// RLE encode MTF output: replaces runs of zeros with run-length codes
+/// Symbols: 0 = RUNA, 1 = RUNB (encode zero runs), 2-256 = MTF values 1-255 shifted
+/// Run encoding: run of N zeros → encode (N) as binary digits using RUNA(=+1)/RUNB(=+2) in power-of-2 positions
+fn rle_zero_encode(data: &[u8]) -> Vec<u16> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < data.len() {
+        if data[i] == 0 {
+            let mut run = 0usize;
+            while i < data.len() && data[i] == 0 { run += 1; i += 1; }
+            // Encode run using bijective base-2: RUNA adds 1*power, RUNB adds 2*power
+            while run > 0 {
+                if run % 2 == 1 { out.push(0); } // RUNA
+                else { out.push(1); } // RUNB
+                run = (run - 1) / 2;
+            }
+        } else {
+            out.push(data[i] as u16 + 1); // shift: MTF value k → symbol k+1
+            i += 1;
+        }
+    }
+    out
+}
+
+fn rle_zero_decode(data: &[u16]) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < data.len() {
+        if data[i] <= 1 {
+            // Decode zero run
+            let mut run = 0usize;
+            let mut power = 1usize;
+            while i < data.len() && data[i] <= 1 {
+                run += (data[i] as usize + 1) * power;
+                power *= 2;
+                i += 1;
+            }
+            for _ in 0..run { out.push(0); }
+        } else {
+            out.push((data[i] - 1) as u8);
+            i += 1;
+        }
+    }
+    out
+}
+
+/// BWT pipeline: BWT → MTF → RLE → Huffman encode
+fn bwt_compress(input: &[u8]) -> Vec<u8> {
+    if input.is_empty() { return Vec::new(); }
+    let bwt_block_size = 900_000usize; // bzip2-style large blocks
+    let mut out = Vec::new();
+    out.extend_from_slice(&(input.len() as u32).to_le_bytes());
+    let num_blocks = (input.len() + bwt_block_size - 1) / bwt_block_size;
+    out.extend_from_slice(&(num_blocks as u32).to_le_bytes());
+    
+    for chunk in input.chunks(bwt_block_size) {
+        let (bwt_data, orig_idx) = bwt_forward(chunk);
+        let mtf_data = mtf_encode(&bwt_data);
+        let rle_data = rle_zero_encode(&mtf_data);
+        
+        // Build frequency table: symbols 0-256 (RUNA=0, RUNB=1, values 2-256) + EOB=257
+        let mut freq = vec![0u32; 258];
+        for &s in &rle_data { freq[s as usize] += 1; }
+        freq[257] = 1; // EOB
+        
+        let lens = build_code_lengths(&freq, 15);
+        let codes = canonical_codes(&lens);
+        
+        out.extend_from_slice(&orig_idx.to_le_bytes());
+        let count = lens.iter().rposition(|&l| l > 0).map(|p| p + 1).unwrap_or(0);
+        out.extend_from_slice(&(count as u16).to_le_bytes());
+        out.extend_from_slice(&lens[..count]);
+        
+        let mut bw = BitWriter::new();
+        for &s in &rle_data {
+            let (code, bits) = codes[s as usize];
+            bw.write_bits(rev_bits(code, bits), bits as u32);
+        }
+        let (eob_code, eob_bits) = codes[257];
+        bw.write_bits(rev_bits(eob_code, eob_bits), eob_bits as u32);
+        let bits_data = bw.flush();
+        out.extend_from_slice(&(bits_data.len() as u32).to_le_bytes());
+        out.extend_from_slice(&bits_data);
+    }
+    out
+}
+
+fn bwt_decompress(input: &[u8]) -> Vec<u8> {
+    if input.len() < 8 { return Vec::new(); }
+    let orig_size = u32::from_le_bytes([input[0], input[1], input[2], input[3]]) as usize;
+    let num_blocks = u32::from_le_bytes([input[4], input[5], input[6], input[7]]) as usize;
+    let mut pos = 8;
+    let mut output = Vec::with_capacity(orig_size);
+    
+    for _ in 0..num_blocks {
+        if pos + 4 > input.len() { break; }
+        let orig_idx = u32::from_le_bytes([input[pos], input[pos+1], input[pos+2], input[pos+3]]); pos += 4;
+        
+        if pos + 2 > input.len() { break; }
+        let count = u16::from_le_bytes([input[pos], input[pos+1]]) as usize; pos += 2;
+        if pos + count > input.len() { break; }
+        let mut lens = vec![0u8; 258];
+        lens[..count].copy_from_slice(&input[pos..pos+count]); pos += count;
+        
+        if pos + 4 > input.len() { break; }
+        let bds = u32::from_le_bytes([input[pos], input[pos+1], input[pos+2], input[pos+3]]) as usize; pos += 4;
+        if pos + bds > input.len() { break; }
+        
+        let (sym_table, len_table, max_bits) = build_decode_table(&lens);
+        let mut reader = BitReader::new(&input[pos..pos+bds]); pos += bds;
+        
+        // Decode RLE symbols until EOB (257)
+        let mut rle_data: Vec<u16> = Vec::new();
+        loop {
+            let sym = decode_sym(&mut reader, &sym_table, &len_table, max_bits);
+            if sym == 257 { break; } // EOB
+            rle_data.push(sym);
+        }
+        
+        let mtf_data = rle_zero_decode(&rle_data);
+        let bwt_data = mtf_decode(&mtf_data);
+        let original = bwt_inverse(&bwt_data, orig_idx);
+        output.extend_from_slice(&original);
+    }
+    output.truncate(orig_size);
+    output
+}
+
 // ─── Transforms ──────────────────────────────────────────────────────────
 
 // Transform mode for literals within a block
@@ -525,20 +727,58 @@ fn encode_block(tokens: &[Token], out: &mut Vec<u8>) {
 
 // ─── Compress ────────────────────────────────────────────────────────────
 
+fn lz77_compress_with_block_size(tokens: &[Token], orig_size: usize, block_size: usize) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(&(orig_size as u32).to_le_bytes());
+    let num_blocks = (tokens.len() + block_size - 1) / block_size;
+    out.extend_from_slice(&(num_blocks as u32).to_le_bytes());
+    for chunk in tokens.chunks(block_size) { encode_block(chunk, &mut out); }
+    out
+}
+
+fn lz77_compress(input: &[u8]) -> Vec<u8> {
+    let tokens = lz77_tokenize(input);
+    // Try multiple block sizes and pick the best
+    let block_sizes = [8192, 16384, 32768, 65536];
+    let mut best = lz77_compress_with_block_size(&tokens, input.len(), BLOCK_SIZE);
+    for &bs in &block_sizes {
+        if bs == BLOCK_SIZE { continue; }
+        let result = lz77_compress_with_block_size(&tokens, input.len(), bs);
+        if result.len() < best.len() { best = result; }
+    }
+    best
+}
+
 pub fn compress(input: &[u8]) -> Vec<u8> {
     if input.is_empty() { return Vec::new(); }
-    let tokens = lz77_tokenize(input);
+    
+    // Try LZ77 pipeline
+    let lz77_result = lz77_compress(input);
+    
+    // Try BWT pipeline (only for inputs that aren't too large — BWT is O(n log²n))
+    let bwt_result = if input.len() <= 2_000_000 {
+        bwt_compress(input)
+    } else {
+        Vec::new() // skip for very large inputs
+    };
+    
+    // Pick the smaller result, prefixed with a mode byte
+    let use_bwt = !bwt_result.is_empty() && bwt_result.len() < lz77_result.len();
+    
     let mut out = Vec::new();
-    out.extend_from_slice(&(input.len() as u32).to_le_bytes());
-    let num_blocks = (tokens.len() + BLOCK_SIZE - 1) / BLOCK_SIZE;
-    out.extend_from_slice(&(num_blocks as u32).to_le_bytes());
-    for chunk in tokens.chunks(BLOCK_SIZE) { encode_block(chunk, &mut out); }
+    if use_bwt {
+        out.push(1u8); // BWT mode
+        out.extend_from_slice(&bwt_result);
+    } else {
+        out.push(0u8); // LZ77 mode
+        out.extend_from_slice(&lz77_result);
+    }
     out
 }
 
 // ─── Decompress ──────────────────────────────────────────────────────────
 
-pub fn decompress(input: &[u8]) -> Vec<u8> {
+fn lz77_decompress(input: &[u8]) -> Vec<u8> {
     if input.len() < 8 { return Vec::new(); }
     let orig_size = u32::from_le_bytes([input[0], input[1], input[2], input[3]]) as usize;
     let num_blocks = u32::from_le_bytes([input[4], input[5], input[6], input[7]]) as usize;
@@ -607,6 +847,16 @@ pub fn decompress(input: &[u8]) -> Vec<u8> {
     output
 }
 
+pub fn decompress(input: &[u8]) -> Vec<u8> {
+    if input.is_empty() { return Vec::new(); }
+    let mode = input[0];
+    let data = &input[1..];
+    match mode {
+        1 => bwt_decompress(data),
+        _ => lz77_decompress(data),
+    }
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let d = args.iter().any(|a| a == "--decompress" || a == "-d");
@@ -621,6 +871,37 @@ mod tests {
     use super::*;
 
     #[test] fn test_roundtrip_empty() { assert_eq!(decompress(&compress(b"")), b""); }
+    #[test]
+    fn test_bwt_roundtrip_basic() {
+        let data = b"banana";
+        let (bwt, idx) = bwt_forward(data);
+        let orig = bwt_inverse(&bwt, idx);
+        assert_eq!(orig, data);
+    }
+    #[test]
+    fn test_mtf_roundtrip() {
+        let data = b"Call me Ishmael. Some years ago.";
+        let encoded = mtf_encode(data);
+        let decoded = mtf_decode(&encoded);
+        assert_eq!(decoded, data);
+    }
+    #[test]
+    fn test_bwt_mtf_roundtrip() {
+        let data = b"Call me Ishmael. Some years ago.";
+        let (bwt, idx) = bwt_forward(data);
+        let mtf = mtf_encode(&bwt);
+        let mtf_dec = mtf_decode(&mtf);
+        assert_eq!(mtf_dec, bwt);
+        let orig = bwt_inverse(&mtf_dec, idx);
+        assert_eq!(orig, data);
+    }
+    #[test]
+    fn test_bwt_compress_roundtrip() {
+        let data = b"Call me Ishmael. Some years ago.";
+        let compressed = bwt_compress(data);
+        let decompressed = bwt_decompress(&compressed);
+        assert_eq!(decompressed, data);
+    }
     #[test] fn test_roundtrip_simple() { let i = b"aaabbbcccc"; assert_eq!(decompress(&compress(i)), i); }
     #[test] fn test_roundtrip_no_runs() { let i = b"abcdefg"; assert_eq!(decompress(&compress(i)), i); }
     #[test] fn test_roundtrip_single() { let i = b"a"; assert_eq!(decompress(&compress(i)), i); }
