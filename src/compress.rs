@@ -191,35 +191,26 @@ impl HashChain {
 
 enum Token { Literal(u8), Match { length: usize, offset: usize } }
 
-fn lz77_tokenize(input: &[u8]) -> Vec<Token> {
-    if input.is_empty() { return Vec::new(); }
+fn dp_parse(input: &[u8], all_matches: &[Vec<(usize, usize)>], ll_cost: &[u32; 286], d_cost: &[u32; 40]) -> Vec<Token> {
     let n = input.len();
-    let mut chain = HashChain::new();
-
-    let mut all_matches: Vec<Vec<(usize, usize)>> = vec![Vec::new(); n];
-    for pos in 0..n {
-        all_matches[pos] = chain.find_matches(input, pos);
-        chain.insert(input, pos);
-    }
-
-    // DP backward pass
     let mut cost = vec![u32::MAX / 2; n + 1];
     let mut choice: Vec<(usize, usize)> = vec![(1, 0); n + 1];
     cost[n] = 0;
 
     for pos in (0..n).rev() {
-        let c = 9u32 + cost[pos + 1];
-        if c < cost[pos] { cost[pos] = c; choice[pos] = (1, 0); }
+        // Literal cost
+        let lit_c = ll_cost[input[pos] as usize] + cost[pos + 1];
+        if lit_c < cost[pos] { cost[pos] = lit_c; choice[pos] = (1, 0); }
         for &(len, off) in &all_matches[pos] {
-            let (_, leb, _) = length_to_code(len);
-            let (_, deb, _) = offset_to_code(off);
-            let mc = 7u32 + leb as u32 + 5 + deb as u32 + cost[pos + len];
+            let (lc, leb, _) = length_to_code(len);
+            let (dc, deb, _) = offset_to_code(off);
+            let mc = ll_cost[lc as usize] + leb as u32 + d_cost[dc as usize] + deb as u32 + cost[pos + len];
             if mc < cost[pos] { cost[pos] = mc; choice[pos] = (len, off); }
             // Try some shorter lengths
             for &sl in &[MIN_MATCH, 4, 5, 6, 8, 12, 16, 24, 32, len/2] {
                 if sl >= MIN_MATCH && sl < len {
-                    let (_, leb, _) = length_to_code(sl);
-                    let mc = 7u32 + leb as u32 + 5 + deb as u32 + cost[pos + sl];
+                    let (slc, sleb, _) = length_to_code(sl);
+                    let mc = ll_cost[slc as usize] + sleb as u32 + d_cost[dc as usize] + deb as u32 + cost[pos + sl];
                     if mc < cost[pos] { cost[pos] = mc; choice[pos] = (sl, off); }
                 }
             }
@@ -234,6 +225,61 @@ fn lz77_tokenize(input: &[u8]) -> Vec<Token> {
         else { tokens.push(Token::Match { length: len, offset: off }); pos += len; }
     }
     tokens
+}
+
+fn lz77_tokenize(input: &[u8]) -> Vec<Token> {
+    if input.is_empty() { return Vec::new(); }
+    let n = input.len();
+    let mut chain = HashChain::new();
+
+    let mut all_matches: Vec<Vec<(usize, usize)>> = vec![Vec::new(); n];
+    for pos in 0..n {
+        all_matches[pos] = chain.find_matches(input, pos);
+        chain.insert(input, pos);
+    }
+
+    // Pass 1: use fixed costs (same as before)
+    let mut ll_cost_fixed = [0u32; 286];
+    for i in 0..256 { ll_cost_fixed[i] = 9; } // literals ~9 bits
+    for i in 257..286 { ll_cost_fixed[i] = 7; } // length codes ~7 bits
+    ll_cost_fixed[256] = 9; // EOB
+    let mut d_cost_fixed = [0u32; 40];
+    for i in 0..40 { d_cost_fixed[i] = 5; } // distance codes ~5 bits
+    
+    let tokens1 = dp_parse(input, &all_matches, &ll_cost_fixed, &d_cost_fixed);
+
+    // Collect frequencies from pass 1
+    let mut ll_freq = [0u32; 286];
+    let mut d_freq = [0u32; 40];
+    for t in &tokens1 {
+        match t {
+            Token::Literal(b) => ll_freq[*b as usize] += 1,
+            Token::Match { length, offset } => {
+                let (c, _, _) = length_to_code(*length);
+                ll_freq[c as usize] += 1;
+                let (dc, _, _) = offset_to_code(*offset);
+                d_freq[dc as usize] += 1;
+            }
+        }
+    }
+    ll_freq[256] += 1;
+
+    // Build Huffman code lengths from pass 1 frequencies
+    let ll_lens = build_code_lengths(&ll_freq, 15);
+    let d_lens = build_code_lengths(&d_freq, 15);
+
+    // Use actual Huffman code lengths as costs for pass 2
+    let mut ll_cost_real = [0u32; 286];
+    for i in 0..286 {
+        ll_cost_real[i] = if ll_lens[i] > 0 { ll_lens[i] as u32 } else { 15 }; // unseen symbols get max cost
+    }
+    let mut d_cost_real = [0u32; 40];
+    for i in 0..40 {
+        d_cost_real[i] = if d_lens[i] > 0 { d_lens[i] as u32 } else { 15 };
+    }
+
+    // Pass 2: re-parse with actual costs
+    dp_parse(input, &all_matches, &ll_cost_real, &d_cost_real)
 }
 
 // ─── Bit I/O ─────────────────────────────────────────────────────────────
