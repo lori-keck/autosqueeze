@@ -445,12 +445,71 @@ fn self_bit_pos_backtrack(reader: &mut BitReader, bits: u32) -> bool {
 
 const BLOCK_SIZE: usize = 8192; // tokens per block
 
-fn encode_block(tokens: &[Token], out: &mut Vec<u8>) {
+// Estimate encoded size without actually encoding (sum of code lengths)
+fn estimate_block_size(tokens: &[Token], transform_literals: bool) -> usize {
     let mut ll_freq = vec![0u32; 286];
     let mut d_freq = vec![0u32; 30];
+    let mut prev_lit = 0u8;
+    
     for t in tokens {
         match t {
-            Token::Literal(b) => ll_freq[*b as usize] += 1,
+            Token::Literal(b) => {
+                let val = if transform_literals { *b ^ prev_lit } else { *b };
+                ll_freq[val as usize] += 1;
+                prev_lit = *b; // always track original for delta
+            }
+            Token::Match { length, offset } => {
+                let (c, _, _) = length_to_code(*length);
+                ll_freq[c as usize] += 1;
+                let (dc, _, _) = offset_to_code(*offset);
+                d_freq[dc as usize] += 1;
+            }
+        }
+    }
+    ll_freq[256] += 1;
+    
+    let ll_lens = build_code_lengths(&ll_freq, 15);
+    let d_lens = build_code_lengths(&d_freq, 15);
+    
+    let mut bits = 0usize;
+    prev_lit = 0;
+    for t in tokens {
+        match t {
+            Token::Literal(b) => {
+                let val = if transform_literals { *b ^ prev_lit } else { *b };
+                bits += ll_lens[val as usize] as usize;
+                prev_lit = *b;
+            }
+            Token::Match { length, offset } => {
+                let (lc, leb, _) = length_to_code(*length);
+                bits += ll_lens[lc as usize] as usize + leb as usize;
+                let (dc, deb, _) = offset_to_code(*offset);
+                bits += d_lens[dc as usize] as usize + deb as usize;
+            }
+        }
+    }
+    bits += ll_lens[256] as usize; // EOB
+    (bits + 7) / 8 // round up to bytes
+}
+
+fn encode_block(tokens: &[Token], out: &mut Vec<u8>) {
+    // Try both normal and XOR-delta encoding, pick whichever is smaller
+    let normal_size = estimate_block_size(tokens, false);
+    let delta_size = estimate_block_size(tokens, true);
+    let use_delta = delta_size < normal_size;
+    
+    // Block type flag: 0 = normal, 1 = delta literals
+    out.push(if use_delta { 1 } else { 0 });
+    let mut ll_freq = vec![0u32; 286];
+    let mut d_freq = vec![0u32; 30];
+    let mut prev_lit = 0u8;
+    for t in tokens {
+        match t {
+            Token::Literal(b) => {
+                let val = if use_delta { *b ^ prev_lit } else { *b };
+                ll_freq[val as usize] += 1;
+                prev_lit = *b;
+            }
             Token::Match { length, offset } => {
                 let (c, _, _) = length_to_code(*length);
                 ll_freq[c as usize] += 1;
@@ -477,10 +536,13 @@ fn encode_block(tokens: &[Token], out: &mut Vec<u8>) {
 
     // Encode tokens
     let mut bw = BitWriter::new();
+    let mut prev_lit2 = 0u8;
     for t in tokens {
         match t {
             Token::Literal(b) => {
-                let (code, bits) = ll_codes[*b as usize];
+                let val = if use_delta { *b ^ prev_lit2 } else { *b };
+                prev_lit2 = *b;
+                let (code, bits) = ll_codes[val as usize];
                 bw.write_bits(rev_bits(code, bits), bits as u32);
             }
             Token::Match { length, offset } => {
@@ -537,6 +599,11 @@ pub fn decompress(input: &[u8]) -> Vec<u8> {
     for _ in 0..num_blocks {
         if output.len() >= orig_size { break; }
         
+        // Read block type flag
+        if pos >= input.len() { break; }
+        let use_delta = input[pos] == 1;
+        pos += 1;
+        
         // Read block header
         if pos + 2 > input.len() { break; }
         let ll_count = u16::from_le_bytes([input[pos], input[pos + 1]]) as usize;
@@ -565,6 +632,7 @@ pub fn decompress(input: &[u8]) -> Vec<u8> {
 
         let mut reader = BitReader::new(&input[pos..pos + bit_data_size]);
         pos += bit_data_size;
+        let mut prev_lit_dec = 0u8;
 
         loop {
             if output.len() >= orig_size { break; }
@@ -572,7 +640,9 @@ pub fn decompress(input: &[u8]) -> Vec<u8> {
             if sym == 256 { break; }
 
             if sym < 256 {
-                output.push(sym as u8);
+                let byte = if use_delta { (sym as u8) ^ prev_lit_dec } else { sym as u8 };
+                prev_lit_dec = byte;
+                output.push(byte);
             } else {
                 let (base_len, eb) = code_to_length_base(sym);
                 let extra = if eb > 0 { reader.read_bits(eb as u32) as usize } else { 0 };
