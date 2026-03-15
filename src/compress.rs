@@ -21,7 +21,7 @@ use std::io::{self, Read, Write};
 const WINDOW_SIZE: usize = 32768;
 const MIN_MATCH: usize = 3;
 const MAX_MATCH: usize = 258;
-const HASH_CHAIN_LIMIT: usize = 96;
+const HASH_CHAIN_LIMIT: usize = 128;
 
 // ─── DEFLATE length/distance tables ──────────────────────────────────────
 
@@ -180,37 +180,119 @@ impl HashChain {
 
 enum Token { Literal(u8), Match { length: usize, offset: usize } }
 
+// Estimate the cost in bits for a literal
+fn literal_cost() -> u32 {
+    9 // rough average Huffman cost for a literal
+}
+
+// Estimate the cost in bits for a match
+fn match_cost(length: usize, offset: usize) -> u32 {
+    let (_, leb, _) = length_to_code(length);
+    let (_, deb, _) = offset_to_code(offset);
+    // Huffman code for length symbol (~7 bits avg) + extra bits + distance code (~5 bits avg) + extra bits
+    7 + leb as u32 + 5 + deb as u32
+}
+
 fn lz77_tokenize(input: &[u8]) -> Vec<Token> {
-    let mut tokens = Vec::new();
+    if input.is_empty() { return Vec::new(); }
+    
+    let n = input.len();
     let mut chain = HashChain::new();
-    let mut pos = 0;
-    while pos < input.len() {
-        let (ml, mo) = chain.find_best_match(input, pos);
-        if ml >= MIN_MATCH && mo <= 32768 {
-            let mut use_lazy = false;
-            if ml < MAX_MATCH && pos + 1 < input.len() {
-                chain.insert(input, pos);
-                let (nl, no) = chain.find_best_match(input, pos + 1);
-                if nl >= ml + 2 && no <= 32768 {
-                    use_lazy = true;
-                    tokens.push(Token::Literal(input[pos]));
-                    pos += 1;
-                    tokens.push(Token::Match { length: nl, offset: no });
-                    for i in 0..nl { chain.insert(input, pos + i); }
-                    pos += nl;
+    
+    // For each position, find the best match
+    // Store matches: Vec of (length, offset) per position
+    let mut matches_at: Vec<Vec<(usize, usize)>> = vec![Vec::new(); n];
+    
+    for pos in 0..n {
+        // Find multiple matches at this position (not just the best)
+        if pos + 2 < n {
+            let h = HashChain::hash4(input, pos) & chain.mask;
+            let mut cp = chain.head[h];
+            let mut count = 0;
+            let min_p = pos.saturating_sub(WINDOW_SIZE);
+            let max_l = MAX_MATCH.min(n - pos);
+            let mut best_for_len = vec![0usize; max_l + 1]; // best (shortest) offset for each length
+            
+            while cp >= 0 && (cp as usize) >= min_p && count < HASH_CHAIN_LIMIT {
+                let c = cp as usize;
+                if c < pos {
+                    let mut l = 0;
+                    while l < max_l && input[c + l] == input[pos + l] { l += 1; }
+                    if l >= MIN_MATCH {
+                        let off = pos - c;
+                        // Record this offset for its max length if it's shorter distance
+                        if best_for_len[l] == 0 || off < best_for_len[l] {
+                            best_for_len[l] = off;
+                        }
+                    }
+                }
+                cp = chain.prev[c % WINDOW_SIZE];
+                count += 1;
+            }
+            
+            // Collect: for each distinct max-length, keep shortest offset
+            // But we only need: longest match at shortest offset, and a few key lengths
+            let mut best_len = 0;
+            for l in (MIN_MATCH..=max_l).rev() {
+                if best_for_len[l] > 0 && l > best_len {
+                    matches_at[pos].push((l, best_for_len[l]));
+                    best_len = l;
                 }
             }
-            if !use_lazy {
-                tokens.push(Token::Match { length: ml, offset: mo });
-                let s = if ml < MAX_MATCH && pos + 1 < input.len() { 1 } else { 0 };
-                if s == 0 { chain.insert(input, pos); }
-                for i in s..ml { chain.insert(input, pos + i); }
-                pos += ml;
+            // Also add shorter matches that have shorter offsets (cheaper distance codes)
+            for l in MIN_MATCH..=best_len {
+                if best_for_len[l] > 0 && best_for_len[l] < best_for_len.get(best_len).copied().unwrap_or(usize::MAX) {
+                    matches_at[pos].push((l, best_for_len[l]));
+                }
             }
-        } else {
+        }
+        chain.insert(input, pos);
+    }
+    
+    // DP: cost[i] = minimum bits to encode input[i..n]
+    let mut cost = vec![u32::MAX; n + 1];
+    let mut choice = vec![(0u8, 0usize, 0usize); n + 1]; // (0=lit, 1=match), length, offset
+    cost[n] = 0;
+    
+    for pos in (0..n).rev() {
+        // Option 1: literal
+        let lit_c = literal_cost().saturating_add(cost[pos + 1]);
+        if lit_c < cost[pos] {
+            cost[pos] = lit_c;
+            choice[pos] = (0, 1, 0);
+        }
+        
+        // Option 2: matches
+        for &(len, off) in &matches_at[pos] {
+            let mc = match_cost(len, off).saturating_add(cost[pos + len]);
+            if mc < cost[pos] {
+                cost[pos] = mc;
+                choice[pos] = (1, len, off);
+            }
+            // Also try shorter lengths with this offset (they advance less but might be cheaper overall)
+            for shorter in [MIN_MATCH, len / 2, len.saturating_sub(1)].iter().copied() {
+                if shorter >= MIN_MATCH && shorter < len {
+                    let mc2 = match_cost(shorter, off).saturating_add(cost[pos + shorter]);
+                    if mc2 < cost[pos] {
+                        cost[pos] = mc2;
+                        choice[pos] = (1, shorter, off);
+                    }
+                }
+            }
+        }
+    }
+    
+    // Reconstruct tokens from DP solution
+    let mut tokens = Vec::new();
+    let mut pos = 0;
+    while pos < n {
+        let (typ, len, off) = choice[pos];
+        if typ == 0 {
             tokens.push(Token::Literal(input[pos]));
-            chain.insert(input, pos);
             pos += 1;
+        } else {
+            tokens.push(Token::Match { length: len, offset: off });
+            pos += len;
         }
     }
     tokens
@@ -443,7 +525,7 @@ fn self_bit_pos_backtrack(reader: &mut BitReader, bits: u32) -> bool {
 
 // ─── Block encoding helper ───────────────────────────────────────────────
 
-const BLOCK_SIZE: usize = 8192; // tokens per block
+const BLOCK_SIZE: usize = 32768; // tokens per block
 
 // Estimate encoded size without actually encoding (sum of code lengths)
 fn estimate_block_size(tokens: &[Token], transform_literals: bool) -> usize {
