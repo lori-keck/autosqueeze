@@ -503,10 +503,104 @@ fn rle_zero_decode(data: &[u16]) -> Vec<u8> {
     out
 }
 
-/// BWT pipeline: BWT → MTF → RLE → Huffman encode
+// ─── Range coder for BWT pipeline ───────────────────────────────────────
+
+const RC_TOP: u32 = 1 << 24;
+const RC_BOT: u32 = 1 << 16;
+
+struct RcModel {
+    freq: Vec<u32>,
+    cum: Vec<u32>,
+    total: u32,
+    nsym: usize,
+}
+
+impl RcModel {
+    fn new(nsym: usize) -> Self {
+        let mut m = RcModel { freq: vec![1; nsym], cum: vec![0; nsym + 1], total: nsym as u32, nsym };
+        m.rebuild();
+        m
+    }
+    fn rebuild(&mut self) {
+        self.cum[0] = 0;
+        for i in 0..self.nsym { self.cum[i+1] = self.cum[i] + self.freq[i]; }
+        self.total = self.cum[self.nsym];
+    }
+    fn update(&mut self, sym: usize) {
+        self.freq[sym] += 1;
+        self.total += 1;
+        if self.total > RC_BOT / 2 {
+            self.total = 0;
+            for i in 0..self.nsym { self.freq[i] = (self.freq[i] + 1) / 2; self.total += self.freq[i]; }
+            self.rebuild();
+        } else {
+            for i in (sym+1)..=self.nsym { self.cum[i] += 1; }
+        }
+    }
+}
+
+struct RcEncoder { low: u32, range: u32, buf: Vec<u8> }
+
+impl RcEncoder {
+    fn new() -> Self { RcEncoder { low: 0, range: 0xFFFFFFFF, buf: Vec::new() } }
+    fn encode(&mut self, model: &mut RcModel, sym: usize) {
+        let r = self.range / model.total;
+        self.low += r * model.cum[sym];
+        if sym + 1 < model.nsym { self.range = r * (model.cum[sym+1] - model.cum[sym]); }
+        else { self.range -= r * model.cum[sym]; }
+        while (self.low ^ self.low.wrapping_add(self.range)) < RC_TOP || self.range < RC_BOT {
+            if (self.low ^ self.low.wrapping_add(self.range)) >= RC_TOP {
+                self.range = self.low.wrapping_neg() & (RC_BOT - 1);
+            }
+            self.buf.push((self.low >> 24) as u8);
+            self.low <<= 8;
+            self.range <<= 8;
+        }
+        model.update(sym);
+    }
+    fn finish(mut self) -> Vec<u8> {
+        for _ in 0..4 { self.buf.push((self.low >> 24) as u8); self.low <<= 8; }
+        self.buf
+    }
+}
+
+struct RcDecoder<'a> { low: u32, range: u32, code: u32, data: &'a [u8], pos: usize }
+
+impl<'a> RcDecoder<'a> {
+    fn new(data: &'a [u8]) -> Self {
+        let mut d = RcDecoder { low: 0, range: 0xFFFFFFFF, code: 0, data, pos: 0 };
+        for _ in 0..4 { d.code = (d.code << 8) | d.byte() as u32; }
+        d
+    }
+    fn byte(&mut self) -> u8 {
+        if self.pos < self.data.len() { let b = self.data[self.pos]; self.pos += 1; b } else { 0 }
+    }
+    fn decode(&mut self, model: &mut RcModel) -> usize {
+        let r = self.range / model.total;
+        let t = ((self.code - self.low) / r).min(model.total - 1);
+        let mut lo = 0usize; let mut hi = model.nsym;
+        while lo < hi { let mid = (lo+hi)/2; if model.cum[mid+1] <= t { lo = mid+1; } else { hi = mid; } }
+        let sym = lo;
+        self.low += r * model.cum[sym];
+        if sym + 1 < model.nsym { self.range = r * (model.cum[sym+1] - model.cum[sym]); }
+        else { self.range -= r * model.cum[sym]; }
+        while (self.low ^ self.low.wrapping_add(self.range)) < RC_TOP || self.range < RC_BOT {
+            if (self.low ^ self.low.wrapping_add(self.range)) >= RC_TOP {
+                self.range = self.low.wrapping_neg() & (RC_BOT - 1);
+            }
+            self.code = (self.code << 8) | self.byte() as u32;
+            self.low <<= 8;
+            self.range <<= 8;
+        }
+        model.update(sym);
+        sym
+    }
+}
+
+/// BWT pipeline: BWT → MTF → RLE → adaptive range coding (no headers needed)
 fn bwt_compress(input: &[u8]) -> Vec<u8> {
     if input.is_empty() { return Vec::new(); }
-    let bwt_block_size = 900_000usize; // bzip2-style large blocks
+    let bwt_block_size = 900_000usize;
     let mut out = Vec::new();
     out.extend_from_slice(&(input.len() as u32).to_le_bytes());
     let num_blocks = (input.len() + bwt_block_size - 1) / bwt_block_size;
@@ -517,34 +611,16 @@ fn bwt_compress(input: &[u8]) -> Vec<u8> {
         let mtf_data = mtf_encode(&bwt_data);
         let rle_data = rle_zero_encode(&mtf_data);
         
-        // Build frequency table: symbols 0-256 (RUNA=0, RUNB=1, values 2-256) + EOB=257
-        let mut freq = vec![0u32; 258];
-        for &s in &rle_data { freq[s as usize] += 1; }
-        freq[257] = 1; // EOB
-        
-        let lens = build_code_lengths(&freq, 15);
-        let codes = canonical_codes(&lens);
-        
         out.extend_from_slice(&orig_idx.to_le_bytes());
-        let count = lens.iter().rposition(|&l| l > 0).map(|p| p + 1).unwrap_or(0);
-        out.extend_from_slice(&(count as u16).to_le_bytes());
-        // Nibble-pack code lengths (4 bits each)
-        for ii in (0..count).step_by(2) {
-            let lo = lens[ii] & 0x0F;
-            let hi = if ii + 1 < count { lens[ii + 1] & 0x0F } else { 0 };
-            out.push(lo | (hi << 4));
-        }
         
-        let mut bw = BitWriter::new();
-        for &s in &rle_data {
-            let (code, bits) = codes[s as usize];
-            bw.write_bits(rev_bits(code, bits), bits as u32);
-        }
-        let (eob_code, eob_bits) = codes[257];
-        bw.write_bits(rev_bits(eob_code, eob_bits), eob_bits as u32);
-        let bits_data = bw.flush();
-        out.extend_from_slice(&(bits_data.len() as u32).to_le_bytes());
-        out.extend_from_slice(&bits_data);
+        // Adaptive range coding: 258 symbols (0-256 values + EOB=257)
+        let mut model = RcModel::new(258);
+        let mut enc = RcEncoder::new();
+        for &s in &rle_data { enc.encode(&mut model, s as usize); }
+        enc.encode(&mut model, 257); // EOB
+        let encoded = enc.finish();
+        out.extend_from_slice(&(encoded.len() as u32).to_le_bytes());
+        out.extend_from_slice(&encoded);
     }
     out
 }
@@ -560,35 +636,19 @@ fn bwt_decompress(input: &[u8]) -> Vec<u8> {
         if pos + 4 > input.len() { break; }
         let orig_idx = u32::from_le_bytes([input[pos], input[pos+1], input[pos+2], input[pos+3]]); pos += 4;
         
-        if pos + 2 > input.len() { break; }
-        let count = u16::from_le_bytes([input[pos], input[pos+1]]) as usize; pos += 2;
-        let _count_for_check = (count + 1) / 2;
-        if pos + _count_for_check > input.len() { break; }
-        let mut lens = vec![0u8; 258];
-        let pk = (count + 1) / 2;
-        // Unpack nibble-packed code lengths
-        for ii in 0..pk {
-            if pos + ii >= input.len() { break; }
-            let byte = input[pos + ii];
-            let idx0 = ii * 2;
-            if idx0 < count { lens[idx0] = byte & 0x0F; }
-            if idx0 + 1 < count { lens[idx0 + 1] = byte >> 4; }
-        }
-        pos += pk;
-        
         if pos + 4 > input.len() { break; }
-        let bds = u32::from_le_bytes([input[pos], input[pos+1], input[pos+2], input[pos+3]]) as usize; pos += 4;
-        if pos + bds > input.len() { break; }
+        let enc_size = u32::from_le_bytes([input[pos], input[pos+1], input[pos+2], input[pos+3]]) as usize; pos += 4;
+        if pos + enc_size > input.len() { break; }
         
-        let (sym_table, len_table, max_bits) = build_decode_table(&lens);
-        let mut reader = BitReader::new(&input[pos..pos+bds]); pos += bds;
+        let mut model = RcModel::new(258);
+        let mut dec = RcDecoder::new(&input[pos..pos+enc_size]); pos += enc_size;
         
-        // Decode RLE symbols until EOB (257)
         let mut rle_data: Vec<u16> = Vec::new();
         loop {
-            let sym = decode_sym(&mut reader, &sym_table, &len_table, max_bits);
-            if sym == 257 { break; } // EOB
-            rle_data.push(sym);
+            let sym = dec.decode(&mut model);
+            if sym == 257 { break; }
+            if rle_data.len() > orig_size * 2 { break; }
+            rle_data.push(sym as u16);
         }
         
         let mtf_data = rle_zero_decode(&rle_data);
@@ -599,6 +659,7 @@ fn bwt_decompress(input: &[u8]) -> Vec<u8> {
     output.truncate(orig_size);
     output
 }
+
 
 // ─── Transforms ──────────────────────────────────────────────────────────
 
