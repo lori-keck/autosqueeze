@@ -443,7 +443,7 @@ fn self_bit_pos_backtrack(reader: &mut BitReader, bits: u32) -> bool {
 
 // ─── Block encoding helper ───────────────────────────────────────────────
 
-const BLOCK_SIZE: usize = 8192; // tokens per block
+const BLOCK_SIZE: usize = 32768; // tokens per block
 
 // Estimate encoded size without actually encoding (sum of code lengths)
 fn estimate_block_size(tokens: &[Token], transform_literals: bool) -> usize {
