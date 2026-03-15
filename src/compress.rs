@@ -834,32 +834,252 @@ fn lz77_compress(input: &[u8]) -> Vec<u8> {
     best
 }
 
-pub fn compress(input: &[u8]) -> Vec<u8> {
-    if input.is_empty() { return Vec::new(); }
-    
-    // Try LZ77 pipeline
-    let lz77_result = lz77_compress(input);
-    
-    // Try BWT pipeline (only for inputs that aren't too large — BWT is O(n log²n))
-    let bwt_result = if input.len() <= 2_000_000 {
-        bwt_compress(input)
-    } else {
-        Vec::new() // skip for very large inputs
-    };
-    
-    // Pick the smaller result, prefixed with a mode byte
-    let use_bwt = !bwt_result.is_empty() && bwt_result.len() < lz77_result.len();
-    
-    let mut out = Vec::new();
-    if use_bwt {
-        out.push(1u8); // BWT mode
-        out.extend_from_slice(&bwt_result);
-    } else {
-        out.push(0u8); // LZ77 mode
-        out.extend_from_slice(&lz77_result);
+// ─── Context Mixing Compressor (PAQ-style) ──────────────────────────────
+
+fn cm_stretch() -> [i16; 4097] {
+    let mut t = [0i16; 4097];
+    for i in 1..4096 {
+        let p = i as f64 / 4096.0;
+        t[i] = ((p / (1.0 - p)).ln() * 64.0).round().max(-2047.0).min(2047.0) as i16;
     }
+    t[0] = -2047; t[4096] = 2047; t
+}
+
+fn cm_squash() -> [u16; 4096] {
+    let mut t = [0u16; 4096];
+    for i in 0..4096 {
+        let s = (i as f64 - 2048.0) / 64.0;
+        let p = 1.0 / (1.0 + (-s).exp());
+        t[i] = (p * 4096.0).round().max(1.0).min(4095.0) as u16;
+    }
+    t
+}
+
+#[inline] fn cmh(a: usize, b: usize) -> usize { a.wrapping_mul(0x9E3779B9).wrapping_add(b) }
+#[inline] fn cm_p(c: &[u16; 2]) -> u32 { let c0 = c[0] as u32 + 1; let c1 = c[1] as u32 + 1; c0 * 4096 / (c0 + c1) }
+#[inline] fn cm_upd(c: &mut [u16; 2], bit: u8) {
+    c[bit as usize] += 1;
+    if c[0] as u32 + c[1] as u32 > 4096 { c[0] = (c[0] >> 1) + 1; c[1] = (c[1] >> 1) + 1; }
+}
+
+struct CMRangeEnc { low: u64, range: u32, cache: u8, csize: u32, out: Vec<u8> }
+impl CMRangeEnc {
+    fn new() -> Self { CMRangeEnc { low: 0, range: 0xFFFFFFFF, cache: 0, csize: 1, out: Vec::new() } }
+    fn shift(&mut self) {
+        let h = (self.low >> 32) as u8;
+        if (self.low as u32) < 0xFF000000 || h != 0 {
+            self.out.push(self.cache.wrapping_add(h));
+            for _ in 1..self.csize { self.out.push(0xFF_u8.wrapping_add(h)); }
+            self.cache = (self.low >> 24) as u8; self.csize = 1;
+        } else { self.csize += 1; }
+        self.low = ((self.low as u32) << 8) as u64;
+    }
+    fn enc(&mut self, p0: u32, bit: u8) {
+        let b = (self.range >> 12) * p0;
+        if bit == 0 { self.range = b; } else { self.low += b as u64; self.range -= b; }
+        while self.range < (1 << 24) { self.range <<= 8; self.shift(); }
+    }
+    fn flush(&mut self) { for _ in 0..5 { self.shift(); } }
+}
+
+struct CMRangeDec<'a> { range: u32, code: u32, data: &'a [u8], pos: usize }
+impl<'a> CMRangeDec<'a> {
+    fn new(data: &'a [u8]) -> Self {
+        let mut d = CMRangeDec { range: 0xFFFFFFFF, code: 0, data, pos: 0 };
+        for _ in 0..5 { d.code = (d.code << 8) | d.rb() as u32; } d
+    }
+    fn rb(&mut self) -> u8 { if self.pos < self.data.len() { let b = self.data[self.pos]; self.pos += 1; b } else { 0 } }
+    fn dec(&mut self, p0: u32) -> u8 {
+        let b = (self.range >> 12) * p0;
+        let bit; if self.code < b { bit = 0; self.range = b; } else { bit = 1; self.code -= b; self.range -= b; }
+        while self.range < (1 << 24) { self.code = (self.code << 8) | self.rb() as u32; self.range <<= 8; }
+        bit
+    }
+}
+
+const CMH_BITS: usize = 23;
+const CMH_SIZE: usize = 1 << CMH_BITS;
+const CMH_MASK: usize = CMH_SIZE - 1;
+const CM_NM: usize = 10;
+
+struct CtxMix {
+    o: [Vec<[u16; 2]>; 10],
+    wt: [i32; CM_NM + 1],
+    prev: [u8; 10],
+    wctx: usize,
+    mt: Vec<u32>, mb: Vec<u8>, ma: bool, mby: u8,
+    sse: Vec<[u16; 2]>,
+    stretch: Box<[i16; 4097]>,
+    squash: Box<[u16; 4096]>,
+}
+
+impl CtxMix {
+    fn new() -> Self {
+        CtxMix {
+            o: [
+                vec![[0u16; 2]; 512],     // o0
+                vec![[0u16; 2]; 65536],   // o1
+                vec![[0u16; 2]; CMH_SIZE], // o2
+                vec![[0u16; 2]; CMH_SIZE], // o3
+                vec![[0u16; 2]; CMH_SIZE], // o4
+                vec![[0u16; 2]; CMH_SIZE], // o5
+                vec![[0u16; 2]; CMH_SIZE], // o6
+                vec![[0u16; 2]; CMH_SIZE], // word
+                vec![[0u16; 2]; CMH_SIZE], // o8
+                vec![[0u16; 2]; CMH_SIZE], // sparse
+            ],
+            wt: [256, 512, 1024, 1536, 1536, 1024, 512, 768, 768, 512, 1024],
+            prev: [0; 10], wctx: 0,
+            mt: vec![0u32; 1 << 22], mb: Vec::new(), ma: false, mby: 0,
+            sse: vec![[0u16; 2]; 64 * 256],
+            stretch: Box::new(cm_stretch()), squash: Box::new(cm_squash()),
+        }
+    }
+
+    fn begin(&mut self) {
+        let cp = self.mb.len(); self.ma = false;
+        if cp >= 8 {
+            let mut h = 0x12345usize;
+            for i in 0..8 { h = cmh(h, self.prev[i] as usize); }
+            let idx = h & (self.mt.len() - 1);
+            let pp = self.mt[idx] as usize;
+            if pp > 0 && pp < cp && pp >= 8 &&
+               (0..8).all(|i| self.mb[pp-8+i] == self.mb[cp-8+i]) && pp < self.mb.len() {
+                self.ma = true; self.mby = self.mb[pp];
+            }
+            self.mt[idx] = cp as u32;
+        }
+    }
+
+    fn predict(&self, partial: usize) -> (u32, [i16; CM_NM+1], [usize; 10], usize) {
+        let p = &self.prev;
+        let (p0,p1,p2,p3,p4,p5,p6,p7) = (p[0] as usize, p[1] as usize, p[2] as usize,
+            p[3] as usize, p[4] as usize, p[5] as usize, p[6] as usize, p[7] as usize);
+        let c = [
+            partial,
+            p0*256 + partial,
+            cmh(cmh(p1, p0), partial) & CMH_MASK,
+            cmh(cmh(cmh(p2, p1), p0), partial) & CMH_MASK,
+            cmh(cmh(cmh(cmh(p3, p2), p1), p0), partial) & CMH_MASK,
+            cmh(cmh(cmh(cmh(cmh(p4, p3), p2), p1), p0), partial) & CMH_MASK,
+            cmh(cmh(cmh(cmh(cmh(cmh(p5, p4), p3), p2), p1), p0)^partial, 0xABCD) & CMH_MASK,
+            cmh(self.wctx, partial) & CMH_MASK,
+            cmh(cmh(cmh(cmh(cmh(cmh(cmh(cmh(p7,p6),p5),p4),p3),p2),p1),p0)^partial, 0x1234) & CMH_MASK,
+            cmh(cmh(p2, p0), partial) & CMH_MASK,
+        ];
+        let mut st = [0i16; CM_NM+1];
+        let mut sum: i64 = 0;
+        for i in 0..10 {
+            let pr = cm_p(&self.o[i][c[i]]);
+            st[i] = self.stretch[pr.min(4096) as usize];
+            sum += self.wt[i] as i64 * st[i] as i64;
+        }
+        if self.ma {
+            let bp = match partial { 1=>7, 2..=3=>6, 4..=7=>5, 8..=15=>4, 16..=31=>3, 32..=63=>2, 64..=127=>1, _=>0 };
+            let pb = (self.mby >> bp) & 1;
+            let mp = if pb == 0 { 3900u32 } else { 196 };
+            st[10] = self.stretch[mp.min(4096) as usize];
+            sum += self.wt[10] as i64 * st[10] as i64;
+        }
+        let wt: i64 = self.wt.iter().map(|&w| w.abs() as i64).sum::<i64>().max(1);
+        let sm = (sum / wt) as i32;
+        let idx = (sm + 2048).max(0).min(4095) as usize;
+        let pmr = (self.squash[idx] as u32).max(1).min(4095);
+        let pq = (pmr >> 6) as usize;
+        let si = (p0 & 0xFF) * 64 + pq;
+        let sp = cm_p(&self.sse[si]);
+        let pq = (pmr >> 6) as usize;
+        let si = (p[0] as usize & 0xFF) * 64 + pq;
+        let sp = cm_p(&self.sse[si]);
+        // Light SSE: 70% mixer, 30% SSE
+        let pf = ((pmr * 70 + sp * 30) / 100).max(1).min(4095);
+        (pf, st, c, si)
+    }
+
+    fn update(&mut self, bit: u8, _pmix: u32, st: &[i16; CM_NM+1], c: &[usize; 10], si: usize) {
+        let err = if bit == 1 { _pmix as i32 } else { _pmix as i32 - 4096 };
+        for i in 0..CM_NM+1 {
+            self.wt[i] -= ((18i64 * err as i64 * st[i] as i64) >> 16) as i32;
+            self.wt[i] = self.wt[i].max(1).min(65536);
+        }
+        for i in 0..10 { cm_upd(&mut self.o[i][c[i]], bit); }
+        cm_upd(&mut self.sse[si], bit);
+    }
+
+    fn end(&mut self, byte: u8) {
+        self.mb.push(byte);
+        if byte.is_ascii_alphabetic() || byte == b'\'' {
+            self.wctx = cmh(self.wctx, byte.to_ascii_lowercase() as usize);
+        } else { self.wctx = 0; }
+        for i in (1..10).rev() { self.prev[i] = self.prev[i-1]; }
+        self.prev[0] = byte;
+    }
+}
+
+fn cm_compress(input: &[u8]) -> Vec<u8> {
+    if input.is_empty() { return Vec::new(); }
+    let mut m = CtxMix::new();
+    let mut enc = CMRangeEnc::new();
+    for &byte in input {
+        m.begin();
+        let mut partial: usize = 1;
+        for bi in (0..8).rev() {
+            let bit = ((byte >> bi) & 1) as u8;
+            let (pr, st, c, si) = m.predict(partial);
+            enc.enc(pr, bit);
+            m.update(bit, pr, &st, &c, si);
+            partial = partial * 2 + bit as usize;
+        }
+        m.end(byte);
+    }
+    enc.flush();
+    let mut out = Vec::new();
+    out.extend_from_slice(&(input.len() as u32).to_le_bytes());
+    out.extend_from_slice(&(enc.out.len() as u32).to_le_bytes());
+    out.extend_from_slice(&enc.out);
     out
 }
+
+fn cm_decompress(input: &[u8]) -> Vec<u8> {
+    if input.len() < 8 { return Vec::new(); }
+    let orig = u32::from_le_bytes([input[0], input[1], input[2], input[3]]) as usize;
+    let esz = u32::from_le_bytes([input[4], input[5], input[6], input[7]]) as usize;
+    if input.len() < 8 + esz { return Vec::new(); }
+    let mut m = CtxMix::new();
+    let mut dec = CMRangeDec::new(&input[8..8+esz]);
+    let mut output = Vec::with_capacity(orig);
+    for _ in 0..orig {
+        m.begin();
+        let mut partial: usize = 1;
+        let mut byte: u8 = 0;
+        for bi in (0..8).rev() {
+            let (pr, st, c, si) = m.predict(partial);
+            let bit = dec.dec(pr);
+            m.update(bit, pr, &st, &c, si);
+            if bit == 1 { byte |= 1 << bi; }
+            partial = partial * 2 + bit as usize;
+        }
+        output.push(byte);
+        m.end(byte);
+    }
+    output
+}
+
+pub fn compress(input: &[u8]) -> Vec<u8> {
+    if input.is_empty() { return Vec::new(); }
+    let lz77_result = lz77_compress(input);
+    let bwt_result = if input.len() <= 2_000_000 { bwt_compress(input) } else { Vec::new() };
+    let cm_result = cm_compress(input);
+    let mut best_mode = 0u8;
+    let mut best = &lz77_result;
+    if !bwt_result.is_empty() && bwt_result.len() < best.len() { best_mode = 1; best = &bwt_result; }
+    if cm_result.len() < best.len() { best_mode = 4; best = &cm_result; }
+    let mut out = Vec::with_capacity(1 + best.len());
+    out.push(best_mode);
+    out.extend_from_slice(best);
+    out
+}
+
 
 // ─── Decompress ──────────────────────────────────────────────────────────
 
@@ -954,6 +1174,7 @@ pub fn decompress(input: &[u8]) -> Vec<u8> {
     let data = &input[1..];
     match mode {
         1 => bwt_decompress(data),
+        4 => cm_decompress(data),
         _ => lz77_decompress(data),
     }
 }
