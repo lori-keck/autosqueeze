@@ -11,7 +11,7 @@
 
 use std::io::{self, Read, Write};
 
-const WINDOW_SIZE: usize = 262144;
+const WINDOW_SIZE: usize = 1048576; // 1MB window
 const MIN_MATCH: usize = 3;
 const MAX_MATCH: usize = 258;
 const HASH_CHAIN_LIMIT: usize = 128;
@@ -63,42 +63,46 @@ fn code_to_length_base(code: u16) -> (usize, u8) {
     }
 }
 
-fn offset_to_code(offset: usize) -> (u8, u8, u16) {
+fn offset_to_code(offset: usize) -> (u8, u8, u32) {
     match offset {
         1 => (0, 0, 0), 2 => (1, 0, 0), 3 => (2, 0, 0), 4 => (3, 0, 0),
-        5..=6 => (4, 1, (offset - 5) as u16),
-        7..=8 => (5, 1, (offset - 7) as u16),
-        9..=12 => (6, 2, (offset - 9) as u16),
-        13..=16 => (7, 2, (offset - 13) as u16),
-        17..=24 => (8, 3, (offset - 17) as u16),
-        25..=32 => (9, 3, (offset - 25) as u16),
-        33..=48 => (10, 4, (offset - 33) as u16),
-        49..=64 => (11, 4, (offset - 49) as u16),
-        65..=96 => (12, 5, (offset - 65) as u16),
-        97..=128 => (13, 5, (offset - 97) as u16),
-        129..=192 => (14, 6, (offset - 129) as u16),
-        193..=256 => (15, 6, (offset - 193) as u16),
-        257..=384 => (16, 7, (offset - 257) as u16),
-        385..=512 => (17, 7, (offset - 385) as u16),
-        513..=768 => (18, 8, (offset - 513) as u16),
-        769..=1024 => (19, 8, (offset - 769) as u16),
-        1025..=1536 => (20, 9, (offset - 1025) as u16),
-        1537..=2048 => (21, 9, (offset - 1537) as u16),
-        2049..=3072 => (22, 10, (offset - 2049) as u16),
-        3073..=4096 => (23, 10, (offset - 3073) as u16),
-        4097..=6144 => (24, 11, (offset - 4097) as u16),
-        6145..=8192 => (25, 11, (offset - 6145) as u16),
-        8193..=12288 => (26, 12, (offset - 8193) as u16),
-        12289..=16384 => (27, 12, (offset - 12289) as u16),
-        16385..=24576 => (28, 13, (offset - 16385) as u16),
-        24577..=32768 => (29, 13, (offset - 24577) as u16),
-        32769..=49152 => (30, 14, (offset - 32769) as u16),
-        49153..=65536 => (31, 14, (offset - 49153) as u16),
-        65537..=98304 => (32, 15, (offset - 65537) as u16),
-        98305..=131072 => (33, 15, (offset - 98305) as u16),
-        131073..=196608 => (34, 16, (offset - 131073) as u16),
-        196609..=262144 => (35, 16, (offset - 196609) as u16),
-        _ => (35, 16, 0),
+        5..=6 => (4, 1, (offset - 5) as u32),
+        7..=8 => (5, 1, (offset - 7) as u32),
+        9..=12 => (6, 2, (offset - 9) as u32),
+        13..=16 => (7, 2, (offset - 13) as u32),
+        17..=24 => (8, 3, (offset - 17) as u32),
+        25..=32 => (9, 3, (offset - 25) as u32),
+        33..=48 => (10, 4, (offset - 33) as u32),
+        49..=64 => (11, 4, (offset - 49) as u32),
+        65..=96 => (12, 5, (offset - 65) as u32),
+        97..=128 => (13, 5, (offset - 97) as u32),
+        129..=192 => (14, 6, (offset - 129) as u32),
+        193..=256 => (15, 6, (offset - 193) as u32),
+        257..=384 => (16, 7, (offset - 257) as u32),
+        385..=512 => (17, 7, (offset - 385) as u32),
+        513..=768 => (18, 8, (offset - 513) as u32),
+        769..=1024 => (19, 8, (offset - 769) as u32),
+        1025..=1536 => (20, 9, (offset - 1025) as u32),
+        1537..=2048 => (21, 9, (offset - 1537) as u32),
+        2049..=3072 => (22, 10, (offset - 2049) as u32),
+        3073..=4096 => (23, 10, (offset - 3073) as u32),
+        4097..=6144 => (24, 11, (offset - 4097) as u32),
+        6145..=8192 => (25, 11, (offset - 6145) as u32),
+        8193..=12288 => (26, 12, (offset - 8193) as u32),
+        12289..=16384 => (27, 12, (offset - 12289) as u32),
+        16385..=24576 => (28, 13, (offset - 16385) as u32),
+        24577..=32768 => (29, 13, (offset - 24577) as u32),
+        32769..=49152 => (30, 14, (offset - 32769) as u32),
+        49153..=65536 => (31, 14, (offset - 49153) as u32),
+        65537..=98304 => (32, 15, (offset - 65537) as u32),
+        98305..=131072 => (33, 15, (offset - 98305) as u32),
+        131073..=196608 => (34, 16, (offset - 131073) as u32),
+        196609..=262144 => (35, 16, (offset - 196609) as u32),
+        262145..=393216 => (36, 17, (offset - 262145) as u32),
+        393217..=524288 => (37, 17, (offset - 393217) as u32),
+        524289..=786432 => (38, 18, (offset - 524289) as u32),
+        786433..=1048576 => (39, 18, (offset - 786433) as u32),
+        _ => (39, 18, 0),
     }
 }
 
@@ -115,6 +119,8 @@ fn code_to_offset_base(code: u8) -> (usize, u8) {
         30 => (32769, 14), 31 => (49153, 14),
         32 => (65537, 15), 33 => (98305, 15),
         34 => (131073, 16), 35 => (196609, 16),
+        36 => (262145, 17), 37 => (393217, 17),
+        38 => (524289, 18), 39 => (786433, 18),
         _ => (0, 0),
     }
 }
@@ -381,7 +387,7 @@ fn decode_sym(reader: &mut BitReader, sym_table: &[u16], len_table: &[u8], max_b
 
 fn estimate_block_size(tokens: &[Token], transform_literals: bool) -> usize {
     let mut ll_freq = vec![0u32; 286];
-    let mut d_freq = vec![0u32; 36];
+    let mut d_freq = vec![0u32; 40];
     let mut prev_lit = 0u8;
     for t in tokens {
         match t {
@@ -425,7 +431,7 @@ fn encode_block(tokens: &[Token], out: &mut Vec<u8>) {
     out.push(if use_delta { 1 } else { 0 });
 
     let mut ll_freq = vec![0u32; 286];
-    let mut d_freq = vec![0u32; 36];
+    let mut d_freq = vec![0u32; 40];
     let mut prev_lit = 0u8;
     for t in tokens {
         match t {
@@ -517,7 +523,7 @@ pub fn decompress(input: &[u8]) -> Vec<u8> {
         if pos >= input.len() { break; }
         let d_count = input[pos] as usize; pos += 1;
         if pos + d_count > input.len() { break; }
-        let mut d_lens = vec![0u8; 36];
+        let mut d_lens = vec![0u8; 40];
         d_lens[..d_count].copy_from_slice(&input[pos..pos + d_count]); pos += d_count;
 
         if pos + 4 > input.len() { break; }
