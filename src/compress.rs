@@ -383,16 +383,43 @@ fn decode_sym(reader: &mut BitReader, sym_table: &[u16], len_table: &[u8], max_b
     sym
 }
 
+// ─── Transforms ──────────────────────────────────────────────────────────
+
+// Transform mode for literals within a block
+#[derive(Clone, Copy, PartialEq)]
+enum LitTransform { None, XorDelta, Mtf }
+
+fn transform_literal(b: u8, prev: u8, mtf_list: &mut [u8; 256], mode: LitTransform) -> u8 {
+    match mode {
+        LitTransform::None => b,
+        LitTransform::XorDelta => b ^ prev,
+        LitTransform::Mtf => {
+            let pos = mtf_list.iter().position(|&x| x == b).unwrap_or(0);
+            // Move to front
+            for i in (1..=pos).rev() { mtf_list[i] = mtf_list[i - 1]; }
+            mtf_list[0] = b;
+            pos as u8
+        }
+    }
+}
+
+fn init_mtf() -> [u8; 256] {
+    let mut list = [0u8; 256];
+    for i in 0..256 { list[i] = i as u8; }
+    list
+}
+
 // ─── Block encoding ──────────────────────────────────────────────────────
 
-fn estimate_block_size(tokens: &[Token], transform_literals: bool) -> usize {
+fn estimate_block_size_mode(tokens: &[Token], mode: LitTransform) -> usize {
     let mut ll_freq = vec![0u32; 286];
     let mut d_freq = vec![0u32; 40];
     let mut prev_lit = 0u8;
+    let mut mtf = init_mtf();
     for t in tokens {
         match t {
             Token::Literal(b) => {
-                let val = if transform_literals { *b ^ prev_lit } else { *b };
+                let val = transform_literal(*b, prev_lit, &mut mtf, mode);
                 ll_freq[val as usize] += 1; prev_lit = *b;
             }
             Token::Match { length, offset } => {
@@ -406,10 +433,11 @@ fn estimate_block_size(tokens: &[Token], transform_literals: bool) -> usize {
     let d_lens = build_code_lengths(&d_freq, 15);
     let mut bits = 0usize;
     prev_lit = 0;
+    let mut mtf2 = init_mtf();
     for t in tokens {
         match t {
             Token::Literal(b) => {
-                let val = if transform_literals { *b ^ prev_lit } else { *b };
+                let val = transform_literal(*b, prev_lit, &mut mtf2, mode);
                 bits += ll_lens[val as usize] as usize; prev_lit = *b;
             }
             Token::Match { length, offset } => {
@@ -425,18 +453,24 @@ fn estimate_block_size(tokens: &[Token], transform_literals: bool) -> usize {
 }
 
 fn encode_block(tokens: &[Token], out: &mut Vec<u8>) {
-    let normal_size = estimate_block_size(tokens, false);
-    let delta_size = estimate_block_size(tokens, true);
-    let use_delta = delta_size < normal_size;
-    out.push(if use_delta { 1 } else { 0 });
+    // Try all 3 modes, pick the smallest
+    let sizes = [
+        estimate_block_size_mode(tokens, LitTransform::None),
+        estimate_block_size_mode(tokens, LitTransform::XorDelta),
+        estimate_block_size_mode(tokens, LitTransform::Mtf),
+    ];
+    let best_mode_idx = sizes.iter().enumerate().min_by_key(|&(_, &s)| s).unwrap().0;
+    let mode = [LitTransform::None, LitTransform::XorDelta, LitTransform::Mtf][best_mode_idx];
+    out.push(best_mode_idx as u8);
 
     let mut ll_freq = vec![0u32; 286];
     let mut d_freq = vec![0u32; 40];
     let mut prev_lit = 0u8;
+    let mut mtf = init_mtf();
     for t in tokens {
         match t {
             Token::Literal(b) => {
-                let val = if use_delta { *b ^ prev_lit } else { *b };
+                let val = transform_literal(*b, prev_lit, &mut mtf, mode);
                 ll_freq[val as usize] += 1; prev_lit = *b;
             }
             Token::Match { length, offset } => {
@@ -461,10 +495,11 @@ fn encode_block(tokens: &[Token], out: &mut Vec<u8>) {
 
     let mut bw = BitWriter::new();
     let mut prev_lit2 = 0u8;
+    let mut mtf2 = init_mtf();
     for t in tokens {
         match t {
             Token::Literal(b) => {
-                let val = if use_delta { *b ^ prev_lit2 } else { *b };
+                let val = transform_literal(*b, prev_lit2, &mut mtf2, mode);
                 prev_lit2 = *b;
                 let (code, bits) = ll_codes[val as usize];
                 bw.write_bits(rev_bits(code, bits), bits as u32);
@@ -512,7 +547,8 @@ pub fn decompress(input: &[u8]) -> Vec<u8> {
 
     for _ in 0..num_blocks {
         if output.len() >= orig_size || pos >= input.len() { break; }
-        let use_delta = input[pos] == 1; pos += 1;
+        let block_mode = input[pos]; pos += 1;
+        // 0 = none, 1 = xor-delta, 2 = MTF
 
         if pos + 2 > input.len() { break; }
         let ll_count = u16::from_le_bytes([input[pos], input[pos + 1]]) as usize; pos += 2;
@@ -534,13 +570,25 @@ pub fn decompress(input: &[u8]) -> Vec<u8> {
         let (d_sym, d_len, d_max) = build_decode_table(&d_lens);
         let mut reader = BitReader::new(&input[pos..pos + bds]); pos += bds;
         let mut prev_lit_dec = 0u8;
+        let mut mtf_dec = init_mtf();
 
         loop {
             if output.len() >= orig_size { break; }
             let sym = decode_sym(&mut reader, &ll_sym, &ll_len, ll_max);
             if sym == 256 { break; }
             if sym < 256 {
-                let byte = if use_delta { (sym as u8) ^ prev_lit_dec } else { sym as u8 };
+                let byte = match block_mode {
+                    1 => (sym as u8) ^ prev_lit_dec,
+                    2 => {
+                        // Inverse MTF: position → original byte
+                        let pos_in_list = sym as usize;
+                        let b = mtf_dec[pos_in_list];
+                        for i in (1..=pos_in_list).rev() { mtf_dec[i] = mtf_dec[i - 1]; }
+                        mtf_dec[0] = b;
+                        b
+                    }
+                    _ => sym as u8,
+                };
                 prev_lit_dec = byte; output.push(byte);
             } else {
                 let (bl, eb) = code_to_length_base(sym);
