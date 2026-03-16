@@ -15,7 +15,7 @@ const WINDOW_SIZE: usize = 1048576; // 1MB window
 const MIN_MATCH: usize = 3;
 const MAX_MATCH: usize = 258;
 const HASH_CHAIN_LIMIT: usize = 512;
-const BLOCK_SIZE: usize = 32768;
+
 
 // ─── DEFLATE length/distance tables ──────────────────────────────────────
 
@@ -263,43 +263,9 @@ fn lz77_tokenize(input: &[u8]) -> Vec<Token> {
     tokens
 }
 
-// ─── Bit I/O ─────────────────────────────────────────────────────────────
 
-struct BitWriter { bytes: Vec<u8>, buf: u64, nbits: u32 }
 
-impl BitWriter {
-    fn new() -> Self { BitWriter { bytes: Vec::new(), buf: 0, nbits: 0 } }
-    fn write_bits(&mut self, val: u32, bits: u32) {
-        self.buf |= (val as u64) << self.nbits;
-        self.nbits += bits;
-        while self.nbits >= 8 { self.bytes.push(self.buf as u8); self.buf >>= 8; self.nbits -= 8; }
-    }
-    fn flush(mut self) -> Vec<u8> { if self.nbits > 0 { self.bytes.push(self.buf as u8); } self.bytes }
-}
-
-struct BitReader<'a> { data: &'a [u8], byte_pos: usize, bit_pos: u32 }
-
-impl<'a> BitReader<'a> {
-    fn new(data: &'a [u8]) -> Self { BitReader { data, byte_pos: 0, bit_pos: 0 } }
-    fn read_bits(&mut self, bits: u32) -> u32 {
-        let mut val = 0u32;
-        let mut br = 0u32;
-        while br < bits {
-            if self.byte_pos >= self.data.len() { return val; }
-            let byte = self.data[self.byte_pos];
-            let avail = 8 - self.bit_pos;
-            let take = (bits - br).min(avail);
-            let mask = ((1u32 << take) - 1) as u8;
-            val |= (((byte >> self.bit_pos) & mask) as u32) << br;
-            br += take;
-            self.bit_pos += take;
-            if self.bit_pos >= 8 { self.bit_pos = 0; self.byte_pos += 1; }
-        }
-        val
-    }
-}
-
-// ─── Huffman ─────────────────────────────────────────────────────────────
+// ─── Huffman code lengths (used by DP cost estimator) ──────────────────────
 
 fn build_code_lengths(freqs: &[u32], max_bits: u8) -> Vec<u8> {
     let n = freqs.len();
@@ -360,54 +326,6 @@ fn build_code_lengths(freqs: &[u32], max_bits: u8) -> Vec<u8> {
     }
     for &i in &active { if lengths[i] == 0 { lengths[i] = max_bits; } }
     lengths
-}
-
-fn canonical_codes(lengths: &[u8]) -> Vec<(u32, u8)> {
-    let n = lengths.len();
-    let mut codes = vec![(0u32, 0u8); n];
-    let mut syms: Vec<(usize, u8)> = lengths.iter().enumerate().filter(|(_, &b)| b > 0).map(|(i, &b)| (i, b)).collect();
-    syms.sort_by(|a, b| a.1.cmp(&b.1).then(a.0.cmp(&b.0)));
-    let mut code: u32 = 0; let mut prev = 0u8;
-    for &(sym, bits) in &syms {
-        if prev > 0 { code += 1; }
-        if bits > prev { code <<= bits - prev; }
-        codes[sym] = (code, bits); prev = bits;
-    }
-    codes
-}
-
-fn rev_bits(val: u32, bits: u8) -> u32 {
-    let mut r = 0u32; let mut v = val;
-    for _ in 0..bits { r = (r << 1) | (v & 1); v >>= 1; } r
-}
-
-fn build_decode_table(lengths: &[u8]) -> (Vec<u16>, Vec<u8>, u8) {
-    let max_bits = lengths.iter().copied().max().unwrap_or(1).max(1);
-    let size = 1usize << max_bits;
-    let mut sym_table = vec![0u16; size];
-    let mut len_table = vec![0u8; size];
-    let codes = canonical_codes(lengths);
-    for (sym, &(code, bits)) in codes.iter().enumerate() {
-        if bits == 0 { continue; }
-        let rev = rev_bits(code, bits) as usize;
-        let fill = 1usize << (max_bits - bits);
-        for j in 0..fill { let idx = rev | (j << bits); sym_table[idx] = sym as u16; len_table[idx] = bits; }
-    }
-    (sym_table, len_table, max_bits)
-}
-
-fn decode_sym(reader: &mut BitReader, sym_table: &[u16], len_table: &[u8], max_bits: u8) -> u16 {
-    let bits = reader.read_bits(max_bits as u32);
-    let idx = bits as usize & (sym_table.len() - 1);
-    let sym = sym_table[idx];
-    let len = len_table[idx];
-    if len < max_bits && len > 0 {
-        let total_bit_pos = reader.byte_pos as u32 * 8 + reader.bit_pos;
-        let new_total = total_bit_pos - (max_bits - len) as u32;
-        reader.byte_pos = (new_total / 8) as usize;
-        reader.bit_pos = new_total % 8;
-    }
-    sym
 }
 
 // ─── BWT (Burrows-Wheeler Transform) ─────────────────────────────────────
@@ -694,6 +612,8 @@ fn bwt_compress_mode_a(mtf_data: &[u8]) -> Vec<u8> {
     enc.finish()
 }
 
+
+
 fn bwt_compress_mode_b(mtf_data: &[u8]) -> Vec<u8> {
     let mut lit_model = BitModel::new(MTF_CTX_GROUPS * LIT_TREE_SIZE);
     let mut enc = RcEncoder::new();
@@ -704,6 +624,7 @@ fn bwt_compress_mode_b(mtf_data: &[u8]) -> Vec<u8> {
     }
     enc.finish()
 }
+
 
 /// Mode C: BWT → MTF → order-2 bit-level with quantized contexts
 fn bwt_compress_mode_c(mtf_data: &[u8]) -> Vec<u8> {
@@ -721,23 +642,7 @@ fn bwt_compress_mode_c(mtf_data: &[u8]) -> Vec<u8> {
     enc.finish()
 }
 
-/// Mode E: BWT → MTF → order-3 bit-level with quantized contexts
-fn bwt_compress_mode_e(mtf_data: &[u8]) -> Vec<u8> {
-    let ctx_count = MTF_CTX_GROUPS * MTF_CTX_GROUPS * MTF_CTX_GROUPS; // 512 contexts
-    let mut lit_model = BitModel::new(ctx_count * LIT_TREE_SIZE);
-    let mut enc = RcEncoder::new();
-    let mut prev1: usize = 0;
-    let mut prev2: usize = 0;
-    let mut prev3: usize = 0;
-    for &b in mtf_data {
-        let ctx = (prev3 * MTF_CTX_GROUPS + prev2) * MTF_CTX_GROUPS + prev1;
-        encode_literal_byte(&mut enc, &mut lit_model, ctx, b);
-        prev3 = prev2;
-        prev2 = prev1;
-        prev1 = mtf_ctx(b);
-    }
-    enc.finish()
-}
+
 
 /// Mode D: BWT → MTF → zero/nonzero split coding
 /// For each byte: first bit = is_zero (contexted by prev MTF quantized)
@@ -804,23 +709,20 @@ fn bwt_compress(input: &[u8]) -> Vec<u8> {
         let enc_b = bwt_compress_mode_b(&mtf_data);
         let enc_c = bwt_compress_mode_c(&mtf_data);
         let enc_d = bwt_compress_mode_d(&mtf_data);
-        let enc_e = bwt_compress_mode_e(&mtf_data);
         
         out.extend_from_slice(&orig_idx.to_le_bytes());
         
-        // Pick smallest mode. Mode A has no block_len header, B/C/D/E do.
+        // Pick smallest mode.
         let size_a = 1 + 4 + enc_a.len();
         let size_b = 1 + 4 + 4 + enc_b.len();
         let size_c = 1 + 4 + 4 + enc_c.len();
         let size_d = 1 + 4 + 4 + enc_d.len();
-        let size_e = 1 + 4 + 4 + enc_e.len();
         
         let mut best_mode = 0u8;
         let mut best_size = size_a;
         if size_b < best_size { best_mode = 1; best_size = size_b; }
         if size_c < best_size { best_mode = 2; best_size = size_c; }
         if size_d < best_size { best_mode = 3; best_size = size_d; }
-        if size_e < best_size { best_mode = 4; best_size = size_e; }
         
         match best_mode {
             0 => {
@@ -840,17 +742,11 @@ fn bwt_compress(input: &[u8]) -> Vec<u8> {
                 out.extend_from_slice(&(enc_c.len() as u32).to_le_bytes());
                 out.extend_from_slice(&enc_c);
             }
-            3 => {
+            _ => {
                 out.push(3u8);
                 out.extend_from_slice(&(mtf_data.len() as u32).to_le_bytes());
                 out.extend_from_slice(&(enc_d.len() as u32).to_le_bytes());
                 out.extend_from_slice(&enc_d);
-            }
-            _ => {
-                out.push(4u8);
-                out.extend_from_slice(&(mtf_data.len() as u32).to_le_bytes());
-                out.extend_from_slice(&(enc_e.len() as u32).to_le_bytes());
-                out.extend_from_slice(&enc_e);
             }
         }
     }
@@ -912,7 +808,7 @@ fn bwt_decompress(input: &[u8]) -> Vec<u8> {
             let original = bwt_inverse(&bwt_data, orig_idx);
             output.extend_from_slice(&original);
         } else if block_mode == 2 {
-            // Mode C: order-2 bit-level range coding (64 quantized contexts)
+            // Mode C: order-2 bit-level (64 quantized contexts)
             if pos + 8 > input.len() { break; }
             let block_len = u32::from_le_bytes([input[pos], input[pos+1], input[pos+2], input[pos+3]]) as usize; pos += 4;
             let enc_size = u32::from_le_bytes([input[pos], input[pos+1], input[pos+2], input[pos+3]]) as usize; pos += 4;
@@ -978,33 +874,6 @@ fn bwt_decompress(input: &[u8]) -> Vec<u8> {
             let bwt_data = mtf_decode(&mtf_data);
             let original = bwt_inverse(&bwt_data, orig_idx);
             output.extend_from_slice(&original);
-        } else if block_mode == 4 {
-            // Mode E: order-3 bit-level range coding (512 quantized contexts)
-            if pos + 8 > input.len() { break; }
-            let block_len = u32::from_le_bytes([input[pos], input[pos+1], input[pos+2], input[pos+3]]) as usize; pos += 4;
-            let enc_size = u32::from_le_bytes([input[pos], input[pos+1], input[pos+2], input[pos+3]]) as usize; pos += 4;
-            if pos + enc_size > input.len() { break; }
-            
-            let ctx_count = MTF_CTX_GROUPS * MTF_CTX_GROUPS * MTF_CTX_GROUPS;
-            let mut lit_model = BitModel::new(ctx_count * LIT_TREE_SIZE);
-            let mut dec = RcDecoder::new(&input[pos..pos+enc_size]); pos += enc_size;
-            
-            let mut mtf_data = Vec::with_capacity(block_len);
-            let mut prev1: usize = 0;
-            let mut prev2: usize = 0;
-            let mut prev3: usize = 0;
-            for _ in 0..block_len {
-                let ctx = (prev3 * MTF_CTX_GROUPS + prev2) * MTF_CTX_GROUPS + prev1;
-                let b = decode_literal_byte(&mut dec, &mut lit_model, ctx);
-                mtf_data.push(b);
-                prev3 = prev2;
-                prev2 = prev1;
-                prev1 = mtf_ctx(b);
-            }
-            
-            let bwt_data = mtf_decode(&mtf_data);
-            let original = bwt_inverse(&bwt_data, orig_idx);
-            output.extend_from_slice(&original);
         }
     }
     output.truncate(orig_size);
@@ -1012,31 +881,6 @@ fn bwt_decompress(input: &[u8]) -> Vec<u8> {
 }
 
 
-// ─── Transforms ──────────────────────────────────────────────────────────
-
-// Transform mode for literals within a block
-#[derive(Clone, Copy, PartialEq)]
-enum LitTransform { None, XorDelta, Mtf }
-
-fn transform_literal(b: u8, prev: u8, mtf_list: &mut [u8; 256], mode: LitTransform) -> u8 {
-    match mode {
-        LitTransform::None => b,
-        LitTransform::XorDelta => b ^ prev,
-        LitTransform::Mtf => {
-            let pos = mtf_list.iter().position(|&x| x == b).unwrap_or(0);
-            // Move to front
-            for i in (1..=pos).rev() { mtf_list[i] = mtf_list[i - 1]; }
-            mtf_list[0] = b;
-            pos as u8
-        }
-    }
-}
-
-fn init_mtf() -> [u8; 256] {
-    let mut list = [0u8; 256];
-    for i in 0..256 { list[i] = i as u8; }
-    list
-}
 
 // ─── Bit-level range coder for literals with context ─────────────────────
 
