@@ -202,11 +202,14 @@ fn lz77_tokenize(input: &[u8]) -> Vec<Token> {
         chain.insert(input, pos);
     }
 
-    // Iterative DP: converge cost estimates over 2 iterations
+    // Iterative DP: 3-pass convergence
+    // Pass 1: uniform cost estimates → DP → Huffman H1
+    // Pass 2: H1 costs → DP → Huffman H2
+    // Pass 3: H2 costs → DP → final choices
     let mut ll_lens = vec![8u8; 286];
     let mut d_lens = vec![5u8; 40];
     let mut choice: Vec<(usize, usize)> = vec![(1, 0); n + 1];
-    for _iter in 0..2 {
+    for _iter in 0..3 {
         let mut cost = vec![u32::MAX / 2; n + 1];
         choice = vec![(1, 0); n + 1];
         cost[n] = 0;
@@ -215,22 +218,19 @@ fn lz77_tokenize(input: &[u8]) -> Vec<Token> {
             let lc = (if lb == 0 { 15 } else { lb as u32 }) + cost[pos + 1];
             if lc < cost[pos] { cost[pos] = lc; choice[pos] = (1, 0); }
             for &(len, off) in &all_matches[pos] {
-                let (lcode, leb, _) = length_to_code(len);
-                let ll = ll_lens[lcode as usize];
-                let ll_c = if ll == 0 { 15 } else { ll as u32 };
                 let (dcode, deb, _) = offset_to_code(off);
                 let dl = d_lens[dcode as usize];
                 let dl_c = if dl == 0 { 15 } else { dl as u32 };
-                let mc = ll_c + leb as u32 + dl_c + deb as u32 + cost[pos + len];
-                if mc < cost[pos] { cost[pos] = mc; choice[pos] = (len, off); }
-                for &sl in &[3,4,5,6,7,8,9,10,11,13,15,17,19,23,27,31,35,43,51,67,83,99,115,131] {
-                    if sl >= MIN_MATCH && sl < len {
-                        let (slc, sleb, _) = length_to_code(sl);
-                        let sll = ll_lens[slc as usize];
-                        let sll_c = if sll == 0 { 15 } else { sll as u32 };
-                        let smc = sll_c + sleb as u32 + dl_c + deb as u32 + cost[pos + sl];
-                        if smc < cost[pos] { cost[pos] = smc; choice[pos] = (sl, off); }
-                    }
+                let dist_cost = dl_c + deb as u32;
+                // Check all lengths from MIN_MATCH to len.
+                // Within each deflate code bracket, extra_bits cost varies by position,
+                // so we check every length to find the true optimum.
+                for sl in MIN_MATCH..=len {
+                    let (slc, sleb, _) = length_to_code(sl);
+                    let sll = ll_lens[slc as usize];
+                    let sll_c = if sll == 0 { 15 } else { sll as u32 };
+                    let smc = sll_c + sleb as u32 + dist_cost + cost[pos + sl];
+                    if smc < cost[pos] { cost[pos] = smc; choice[pos] = (sl, off); }
                 }
             }
         }
