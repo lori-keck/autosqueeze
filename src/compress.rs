@@ -530,6 +530,19 @@ fn rle_zero_decode(data: &[u16]) -> Vec<u8> {
     out
 }
 
+fn mtf_context_bin(prev_value: u16) -> usize {
+    match prev_value {
+        0 => 0,
+        1 => 1,
+        2..=3 => 2,
+        4..=7 => 3,
+        8..=15 => 4,
+        16..=31 => 5,
+        32..=63 => 6,
+        _ => 7,
+    }
+}
+
 // ─── Range coder for BWT pipeline ───────────────────────────────────────
 
 const RC_TOP: u32 = 1 << 24;
@@ -624,7 +637,7 @@ impl<'a> RcDecoder<'a> {
     }
 }
 
-/// BWT pipeline: BWT → MTF → RLE → adaptive range coding (no headers needed)
+/// BWT pipeline: BWT → MTF → RLE → adaptive range coding with 8 context bins
 fn bwt_compress(input: &[u8]) -> Vec<u8> {
     if input.is_empty() { return Vec::new(); }
     let bwt_block_size = 1_500_000usize;
@@ -632,19 +645,28 @@ fn bwt_compress(input: &[u8]) -> Vec<u8> {
     out.extend_from_slice(&(input.len() as u32).to_le_bytes());
     let num_blocks = (input.len() + bwt_block_size - 1) / bwt_block_size;
     out.extend_from_slice(&(num_blocks as u32).to_le_bytes());
-    
+
     for chunk in input.chunks(bwt_block_size) {
         let (bwt_data, orig_idx) = bwt_forward(chunk);
         let mtf_data = mtf_encode(&bwt_data);
         let rle_data = rle_zero_encode(&mtf_data);
-        
+
         out.extend_from_slice(&orig_idx.to_le_bytes());
-        
-        // Adaptive range coding: 258 symbols (0-256 values + EOB=257)
-        let mut model = RcModel::new(258);
+
+        // 8 context bins derived from previous MTF symbol magnitude.
+        // Symbols: 0..=256 from RLE stream, 257 = EOB.
+        let mut models: Vec<RcModel> = (0..8).map(|_| RcModel::new(258)).collect();
         let mut enc = RcEncoder::new();
-        for &s in &rle_data { enc.encode(&mut model, s as usize); }
-        enc.encode(&mut model, 257); // EOB
+        let mut prev_sym = 0u16;
+
+        for &sym in &rle_data {
+            let ctx = mtf_context_bin(prev_sym);
+            enc.encode(&mut models[ctx], sym as usize);
+            prev_sym = sym;
+        }
+
+        let eob_ctx = mtf_context_bin(prev_sym);
+        enc.encode(&mut models[eob_ctx], 257);
         let encoded = enc.finish();
         out.extend_from_slice(&(encoded.len() as u32).to_le_bytes());
         out.extend_from_slice(&encoded);
@@ -656,28 +678,39 @@ fn bwt_decompress(input: &[u8]) -> Vec<u8> {
     if input.len() < 8 { return Vec::new(); }
     let orig_size = u32::from_le_bytes([input[0], input[1], input[2], input[3]]) as usize;
     let num_blocks = u32::from_le_bytes([input[4], input[5], input[6], input[7]]) as usize;
+    let bwt_block_size = 1_500_000usize;
     let mut pos = 8;
     let mut output = Vec::with_capacity(orig_size);
-    
-    for _ in 0..num_blocks {
+
+    for block_idx in 0..num_blocks {
         if pos + 4 > input.len() { break; }
         let orig_idx = u32::from_le_bytes([input[pos], input[pos+1], input[pos+2], input[pos+3]]); pos += 4;
-        
+
         if pos + 4 > input.len() { break; }
         let enc_size = u32::from_le_bytes([input[pos], input[pos+1], input[pos+2], input[pos+3]]) as usize; pos += 4;
         if pos + enc_size > input.len() { break; }
-        
-        let mut model = RcModel::new(258);
+
+        let block_len = if block_idx + 1 < num_blocks {
+            bwt_block_size.min(orig_size.saturating_sub(output.len()))
+        } else {
+            orig_size.saturating_sub(output.len())
+        };
+
+        let mut models: Vec<RcModel> = (0..8).map(|_| RcModel::new(258)).collect();
         let mut dec = RcDecoder::new(&input[pos..pos+enc_size]); pos += enc_size;
-        
+
         let mut rle_data: Vec<u16> = Vec::new();
+        let mut prev_sym = 0u16;
         loop {
-            let sym = dec.decode(&mut model);
+            let ctx = mtf_context_bin(prev_sym);
+            let sym = dec.decode(&mut models[ctx]);
             if sym == 257 { break; }
-            if rle_data.len() > orig_size * 2 { break; }
-            rle_data.push(sym as u16);
+            if rle_data.len() > block_len.saturating_mul(2).saturating_add(32) { break; }
+            let sym_u16 = sym as u16;
+            rle_data.push(sym_u16);
+            prev_sym = sym_u16;
         }
-        
+
         let mtf_data = rle_zero_decode(&rle_data);
         let bwt_data = mtf_decode(&mtf_data);
         let original = bwt_inverse(&bwt_data, orig_idx);
