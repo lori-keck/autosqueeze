@@ -643,9 +643,13 @@ struct BwtBitModel {
 }
 
 impl BwtBitModel {
+    const PROB_BITS: u32 = 11;
+    const PROB_MAX: u32 = 1 << Self::PROB_BITS; // 2048
+    const PROB_HALF: u16 = (1 << 10) as u16; // 1024
+
     fn new() -> Self {
         BwtBitModel {
-            prob: vec![2048u16; BWTRC_NUM_CTX * 256],
+            prob: vec![Self::PROB_HALF; BWTRC_NUM_CTX * 256],
         }
     }
 
@@ -664,7 +668,9 @@ impl BwtBitModel {
             let i = Self::idx(ctx, node);
             let p1 = self.prob[i] as u32;
 
-            let bound = enc.low.wrapping_add((enc.range >> 12).wrapping_mul(4096 - p1));
+            let bound = enc.low.wrapping_add(
+                (enc.range >> Self::PROB_BITS).wrapping_mul(Self::PROB_MAX - p1)
+            );
 
             if bit == 0 {
                 enc.range = bound.wrapping_sub(enc.low);
@@ -683,7 +689,7 @@ impl BwtBitModel {
             }
 
             if bit == 1 {
-                self.prob[i] += ((4096 - p1) >> Self::ADAPT_SHIFT) as u16;
+                self.prob[i] += ((Self::PROB_MAX - p1) >> Self::ADAPT_SHIFT) as u16;
             } else {
                 self.prob[i] -= (p1 >> Self::ADAPT_SHIFT) as u16;
             }
@@ -699,7 +705,9 @@ impl BwtBitModel {
             let i = Self::idx(ctx, node);
             let p1 = self.prob[i] as u32;
 
-            let bound = dec.low.wrapping_add((dec.range >> 12).wrapping_mul(4096 - p1));
+            let bound = dec.low.wrapping_add(
+                (dec.range >> Self::PROB_BITS).wrapping_mul(Self::PROB_MAX - p1)
+            );
 
             let bit;
             if dec.code < bound {
@@ -721,7 +729,7 @@ impl BwtBitModel {
             }
 
             if bit == 1 {
-                self.prob[i] += ((4096 - p1) >> Self::ADAPT_SHIFT) as u16;
+                self.prob[i] += ((Self::PROB_MAX - p1) >> Self::ADAPT_SHIFT) as u16;
             } else {
                 self.prob[i] -= (p1 >> Self::ADAPT_SHIFT) as u16;
             }
