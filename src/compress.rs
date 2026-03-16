@@ -624,8 +624,128 @@ impl<'a> RcDecoder<'a> {
     }
 }
 
-/// BWT pipeline: BWT → MTF → RLE → adaptive range coding (no headers needed)
-fn bwt_compress(input: &[u8]) -> Vec<u8> {
+// ─── Bitwise context model for BWT pipeline ─────────────────────────────
+
+/// Bitwise binary range coder with context modeling.
+/// Each byte is encoded as 8 binary decisions through a binary tree (MSB first).
+/// Context = (order_context, tree_node) where tree_node tracks decoded bits so far.
+/// Binary contexts adapt very fast (only 2 outcomes), making this effective even
+/// with many context buckets.
+///
+/// Uses 12-bit fixed-point probability with exponential smoothing for fast adaptation.
+
+const BWTRC_NUM_CTX: usize = 256; // context buckets
+
+struct BwtBitModel {
+    // Probability of bit=1, stored as 12-bit fixed point (0..4096)
+    // Index: ctx * 256 + tree_node (tree_node: 1..255, MSB-first binary tree)
+    prob: Vec<u16>,
+}
+
+impl BwtBitModel {
+    fn new() -> Self {
+        BwtBitModel {
+            prob: vec![2048u16; BWTRC_NUM_CTX * 256],
+        }
+    }
+
+    #[inline(always)]
+    fn idx(ctx: usize, tree_node: usize) -> usize {
+        ctx * 256 + tree_node
+    }
+
+    /// Adaptation rate: shift by 3 = divide by 8 = ~12.5% adaptation per sample
+    const ADAPT_SHIFT: u32 = 3;
+
+    fn encode_byte(&mut self, enc: &mut RcEncoder, ctx: usize, byte: u8) {
+        let mut node = 1usize;
+        for bit_pos in (0..8).rev() {
+            let bit = ((byte >> bit_pos) & 1) as u32;
+            let i = Self::idx(ctx, node);
+            let p1 = self.prob[i] as u32;
+
+            let bound = enc.low.wrapping_add((enc.range >> 12).wrapping_mul(4096 - p1));
+
+            if bit == 0 {
+                enc.range = bound.wrapping_sub(enc.low);
+            } else {
+                enc.range = enc.range - (bound.wrapping_sub(enc.low));
+                enc.low = bound;
+            }
+
+            while (enc.low ^ enc.low.wrapping_add(enc.range)) < RC_TOP || enc.range < RC_BOT {
+                if (enc.low ^ enc.low.wrapping_add(enc.range)) >= RC_TOP {
+                    enc.range = enc.low.wrapping_neg() & (RC_BOT - 1);
+                }
+                enc.buf.push((enc.low >> 24) as u8);
+                enc.low <<= 8;
+                enc.range <<= 8;
+            }
+
+            if bit == 1 {
+                self.prob[i] += ((4096 - p1) >> Self::ADAPT_SHIFT) as u16;
+            } else {
+                self.prob[i] -= (p1 >> Self::ADAPT_SHIFT) as u16;
+            }
+
+            node = node * 2 + bit as usize;
+        }
+    }
+
+    fn decode_byte(&mut self, dec: &mut RcDecoder, ctx: usize) -> u8 {
+        let mut node = 1usize;
+        let mut byte = 0u8;
+        for bit_pos in (0..8).rev() {
+            let i = Self::idx(ctx, node);
+            let p1 = self.prob[i] as u32;
+
+            let bound = dec.low.wrapping_add((dec.range >> 12).wrapping_mul(4096 - p1));
+
+            let bit;
+            if dec.code < bound {
+                bit = 0u32;
+                dec.range = bound.wrapping_sub(dec.low);
+            } else {
+                bit = 1;
+                dec.range = dec.range - (bound.wrapping_sub(dec.low));
+                dec.low = bound;
+            }
+
+            while (dec.low ^ dec.low.wrapping_add(dec.range)) < RC_TOP || dec.range < RC_BOT {
+                if (dec.low ^ dec.low.wrapping_add(dec.range)) >= RC_TOP {
+                    dec.range = dec.low.wrapping_neg() & (RC_BOT - 1);
+                }
+                dec.code = (dec.code << 8) | dec.byte() as u32;
+                dec.low <<= 8;
+                dec.range <<= 8;
+            }
+
+            if bit == 1 {
+                self.prob[i] += ((4096 - p1) >> Self::ADAPT_SHIFT) as u16;
+            } else {
+                self.prob[i] -= (p1 >> Self::ADAPT_SHIFT) as u16;
+            }
+
+            byte |= (bit as u8) << bit_pos;
+            node = node * 2 + bit as usize;
+        }
+        byte
+    }
+}
+
+/// Compute the F-column (sorted first column) from byte frequency counts.
+fn compute_f_column_from_counts(counts: &[u32; 256], n: usize) -> Vec<u8> {
+    let mut f = Vec::with_capacity(n);
+    for c in 0..256u16 {
+        for _ in 0..counts[c as usize] {
+            f.push(c as u8);
+        }
+    }
+    f
+}
+
+/// BWT pipeline v1: BWT → MTF → RLE → adaptive order-0 range coding (original)
+fn bwt_compress_v1(input: &[u8]) -> Vec<u8> {
     if input.is_empty() { return Vec::new(); }
     let bwt_block_size = 1_500_000usize;
     let mut out = Vec::new();
@@ -640,7 +760,6 @@ fn bwt_compress(input: &[u8]) -> Vec<u8> {
         
         out.extend_from_slice(&orig_idx.to_le_bytes());
         
-        // Adaptive range coding: 258 symbols (0-256 values + EOB=257)
         let mut model = RcModel::new(258);
         let mut enc = RcEncoder::new();
         for &s in &rle_data { enc.encode(&mut model, s as usize); }
@@ -652,7 +771,7 @@ fn bwt_compress(input: &[u8]) -> Vec<u8> {
     out
 }
 
-fn bwt_decompress(input: &[u8]) -> Vec<u8> {
+fn bwt_decompress_v1(input: &[u8]) -> Vec<u8> {
     if input.len() < 8 { return Vec::new(); }
     let orig_size = u32::from_le_bytes([input[0], input[1], input[2], input[3]]) as usize;
     let num_blocks = u32::from_le_bytes([input[4], input[5], input[6], input[7]]) as usize;
@@ -680,6 +799,97 @@ fn bwt_decompress(input: &[u8]) -> Vec<u8> {
         
         let mtf_data = rle_zero_decode(&rle_data);
         let bwt_data = mtf_decode(&mtf_data);
+        let original = bwt_inverse(&bwt_data, orig_idx);
+        output.extend_from_slice(&original);
+    }
+    output.truncate(orig_size);
+    output
+}
+
+/// BWT pipeline v2: BWT → bitwise F-column-context range coding (no MTF/RLE)
+/// Uses the BWT matrix F column as context — this is the natural order-1 context
+/// for BWT output, since L[i] (BWT output) is the byte that precedes F[i] in the
+/// original text.
+fn bwt_compress(input: &[u8]) -> Vec<u8> {
+    if input.is_empty() { return Vec::new(); }
+    let bwt_block_size = 1_500_000usize;
+    let mut out = Vec::new();
+    out.extend_from_slice(&(input.len() as u32).to_le_bytes());
+    let num_blocks = (input.len() + bwt_block_size - 1) / bwt_block_size;
+    out.extend_from_slice(&(num_blocks as u32).to_le_bytes());
+    
+    for chunk in input.chunks(bwt_block_size) {
+        let (bwt_data, orig_idx) = bwt_forward(chunk);
+        
+        // Compute byte frequencies for F-column reconstruction
+        let mut counts = [0u32; 256];
+        for &b in &bwt_data { counts[b as usize] += 1; }
+        let f_col = compute_f_column_from_counts(&counts, bwt_data.len());
+        
+        out.extend_from_slice(&orig_idx.to_le_bytes());
+        out.extend_from_slice(&(bwt_data.len() as u32).to_le_bytes());
+        
+        // Write byte frequency table as packed 24-bit values (max 16M per block)
+        // Cost: 768 bytes per block — negligible for 1.5M blocks
+        for i in 0..256 {
+            let c = counts[i];
+            out.push(c as u8);
+            out.push((c >> 8) as u8);
+            out.push((c >> 16) as u8);
+        }
+        
+        // Bitwise range coding with F-column context (no MTF/RLE)
+        let mut model = BwtBitModel::new();
+        let mut enc = RcEncoder::new();
+        
+        for i in 0..bwt_data.len() {
+            model.encode_byte(&mut enc, f_col[i] as usize, bwt_data[i]);
+        }
+        
+        let encoded = enc.finish();
+        out.extend_from_slice(&(encoded.len() as u32).to_le_bytes());
+        out.extend_from_slice(&encoded);
+    }
+    out
+}
+
+fn bwt_decompress(input: &[u8]) -> Vec<u8> {
+    if input.len() < 8 { return Vec::new(); }
+    let orig_size = u32::from_le_bytes([input[0], input[1], input[2], input[3]]) as usize;
+    let num_blocks = u32::from_le_bytes([input[4], input[5], input[6], input[7]]) as usize;
+    let mut pos = 8;
+    let mut output = Vec::with_capacity(orig_size);
+    
+    for _ in 0..num_blocks {
+        if pos + 4 > input.len() { break; }
+        let orig_idx = u32::from_le_bytes([input[pos], input[pos+1], input[pos+2], input[pos+3]]); pos += 4;
+        
+        if pos + 4 > input.len() { break; }
+        let block_len = u32::from_le_bytes([input[pos], input[pos+1], input[pos+2], input[pos+3]]) as usize; pos += 4;
+        
+        // Read byte frequency table (24-bit values) to reconstruct F column
+        if pos + 768 > input.len() { break; }
+        let mut counts = [0u32; 256];
+        for i in 0..256 {
+            counts[i] = input[pos] as u32 | ((input[pos+1] as u32) << 8) | ((input[pos+2] as u32) << 16);
+            pos += 3;
+        }
+        let f_col = compute_f_column_from_counts(&counts, block_len);
+        
+        if pos + 4 > input.len() { break; }
+        let enc_size = u32::from_le_bytes([input[pos], input[pos+1], input[pos+2], input[pos+3]]) as usize; pos += 4;
+        if pos + enc_size > input.len() { break; }
+        
+        let mut model = BwtBitModel::new();
+        let mut dec = RcDecoder::new(&input[pos..pos+enc_size]); pos += enc_size;
+        
+        let mut bwt_data = Vec::with_capacity(block_len);
+        
+        for i in 0..block_len {
+            let b = model.decode_byte(&mut dec, f_col[i] as usize);
+            bwt_data.push(b);
+        }
+        
         let original = bwt_inverse(&bwt_data, orig_idx);
         output.extend_from_slice(&original);
     }
@@ -867,24 +1077,29 @@ pub fn compress(input: &[u8]) -> Vec<u8> {
     // Try LZ77 pipeline
     let lz77_result = lz77_compress(input);
     
-    // Try BWT pipeline (only for inputs that aren't too large — BWT is O(n log²n))
-    let bwt_result = if input.len() <= 2_000_000 {
-        bwt_compress(input)
+    // Try BWT pipelines (only for inputs that aren't too large — BWT is O(n log²n))
+    let (bwt_v1_result, bwt_v2_result) = if input.len() <= 2_000_000 {
+        (bwt_compress_v1(input), bwt_compress(input))
     } else {
-        Vec::new() // skip for very large inputs
+        (Vec::new(), Vec::new())
     };
     
-    // Pick the smaller result, prefixed with a mode byte
-    let use_bwt = !bwt_result.is_empty() && bwt_result.len() < lz77_result.len();
+    // Pick the smallest result, prefixed with a mode byte
+    let mut best = &lz77_result;
+    let mut best_mode = 0u8; // LZ77
     
-    let mut out = Vec::new();
-    if use_bwt {
-        out.push(1u8); // BWT mode
-        out.extend_from_slice(&bwt_result);
-    } else {
-        out.push(0u8); // LZ77 mode
-        out.extend_from_slice(&lz77_result);
+    if !bwt_v1_result.is_empty() && bwt_v1_result.len() < best.len() {
+        best = &bwt_v1_result;
+        best_mode = 1; // BWT v1 (MTF+RLE+order-0)
     }
+    if !bwt_v2_result.is_empty() && bwt_v2_result.len() < best.len() {
+        best = &bwt_v2_result;
+        best_mode = 2; // BWT v2 (F-column bitwise)
+    }
+    
+    let mut out = Vec::with_capacity(1 + best.len());
+    out.push(best_mode);
+    out.extend_from_slice(best);
     out
 }
 
@@ -980,7 +1195,8 @@ pub fn decompress(input: &[u8]) -> Vec<u8> {
     let mode = input[0];
     let data = &input[1..];
     match mode {
-        1 => bwt_decompress(data),
+        1 => bwt_decompress_v1(data),
+        2 => bwt_decompress(data),
         _ => lz77_decompress(data),
     }
 }
