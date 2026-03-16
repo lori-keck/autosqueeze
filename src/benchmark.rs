@@ -13,6 +13,7 @@
 
 // Import compress/decompress from the compress module
 // We compile compress.rs as a library for benchmarking
+#[allow(dead_code, unused_imports)]
 mod compress_lib {
     include!("compress.rs");
 }
@@ -23,7 +24,7 @@ use std::time::Instant;
 
 fn main() {
     println!("╔══════════════════════════════════════════════════╗");
-    println!("║           autosqueeze benchmark                 ║");
+    println!("║              crunch benchmark                   ║");
     println!("╚══════════════════════════════════════════════════╝\n");
 
     let corpus_dir = Path::new("corpus");

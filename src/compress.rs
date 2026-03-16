@@ -1,13 +1,11 @@
-/// compress.rs — THE FILE THE AGENT EDITS
+/// compress.rs — The Crunch compression algorithm
 ///
-/// ALGORITHM: LZ77 (optimal DP parsing) + Block Range Coding
+/// Dual-pipeline compressor discovered through autonomous AI research.
 ///
-/// Pipeline:
-///   1. LZ77 with hash chains + DP optimal parsing → token stream
-///   2. Split into blocks
-///   3. Each block: build frequency tables, range-encode symbols
+/// Pipeline 1 (LZ77): Hash chains + DP optimal parsing → block range coding
+/// Pipeline 2 (BWT):  Burrows-Wheeler Transform → MTF → RLE → adaptive order-1 range coding
 ///
-/// Range coding replaces Huffman for fractional-bit precision (~1-3% better).
+/// Best pipeline selected per block automatically.
 
 use std::io::{self, Read, Write};
 

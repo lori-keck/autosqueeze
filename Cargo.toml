@@ -1,8 +1,8 @@
 [package]
-name = "autosqueeze"
+name = "crunch"
 version = "0.1.0"
 edition = "2021"
-description = "Autonomous compression research — an AI agent searches for novel compression algorithms"
+description = "AI-discovered compression — autonomous agents research novel compression algorithms"
 license = "MIT"
 
 [[bin]]
