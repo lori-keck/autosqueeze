@@ -16,6 +16,7 @@ const MIN_MATCH: usize = 3;
 const MAX_MATCH: usize = 258;
 const HASH_CHAIN_LIMIT: usize = 512;
 const BLOCK_SIZE: usize = 32768;
+const NUM_DIST_WITH_REP: usize = 44; // 4 rep codes + 40 original distance codes
 
 // ─── DEFLATE length/distance tables ──────────────────────────────────────
 
@@ -189,7 +190,11 @@ impl HashChain {
 
 // ─── LZ77 Token + Optimal Parsing ───────────────────────────────────────
 
-enum Token { Literal(u8), Match { length: usize, offset: usize } }
+enum Token {
+    Literal(u8),
+    Match { length: usize, offset: usize },
+    RepMatch { length: usize, rep_idx: u8 }, // rep_idx: 0-3, index into recent distance cache
+}
 
 fn lz77_tokenize(input: &[u8]) -> Vec<Token> {
     if input.is_empty() { return Vec::new(); }
@@ -202,10 +207,14 @@ fn lz77_tokenize(input: &[u8]) -> Vec<Token> {
         chain.insert(input, pos);
     }
 
-    // Iterative DP: converge cost estimates over 2 iterations
+    // Iterative DP: 2 passes
+    // Pass 1: backward DP (no rep codes) for initial cost model
+    // Pass 2: backward DP with updated cost model
+    // Then post-process with rep codes
     let mut ll_lens = vec![8u8; 286];
-    let mut d_lens = vec![5u8; 40];
+    let mut d_lens = vec![5u8; NUM_DIST_WITH_REP];
     let mut choice: Vec<(usize, usize)> = vec![(1, 0); n + 1];
+    
     for _iter in 0..2 {
         let mut cost = vec![u32::MAX / 2; n + 1];
         choice = vec![(1, 0); n + 1];
@@ -219,7 +228,7 @@ fn lz77_tokenize(input: &[u8]) -> Vec<Token> {
                 let ll = ll_lens[lcode as usize];
                 let ll_c = if ll == 0 { 15 } else { ll as u32 };
                 let (dcode, deb, _) = offset_to_code(off);
-                let dl = d_lens[dcode as usize];
+                let dl = d_lens[dcode as usize + 4]; // shifted by 4 for rep code space
                 let dl_c = if dl == 0 { 15 } else { dl as u32 };
                 let mc = ll_c + leb as u32 + dl_c + deb as u32 + cost[pos + len];
                 if mc < cost[pos] { cost[pos] = mc; choice[pos] = (len, off); }
@@ -234,8 +243,10 @@ fn lz77_tokenize(input: &[u8]) -> Vec<Token> {
                 }
             }
         }
+        // Forward frequency counting with rep code awareness
         let mut ll_freq = vec![1u32; 286];
-        let mut d_freq = vec![1u32; 40];
+        let mut d_freq = vec![1u32; NUM_DIST_WITH_REP];
+        let mut rep_dists = [0usize; 4];
         let mut p = 0;
         while p < n {
             let (len, off) = choice[p];
@@ -243,8 +254,19 @@ fn lz77_tokenize(input: &[u8]) -> Vec<Token> {
             else {
                 let (lc, _, _) = length_to_code(len);
                 ll_freq[lc as usize] += 1;
-                let (dc, _, _) = offset_to_code(off);
-                d_freq[dc as usize] += 1;
+                if let Some(ri) = rep_dists.iter().position(|&d| d == off && d != 0) {
+                    d_freq[ri] += 1;
+                    if ri > 0 {
+                        let dist = rep_dists[ri];
+                        for i in (1..=ri).rev() { rep_dists[i] = rep_dists[i - 1]; }
+                        rep_dists[0] = dist;
+                    }
+                } else {
+                    let (dc, _, _) = offset_to_code(off);
+                    d_freq[dc as usize + 4] += 1;
+                    for i in (1..4).rev() { rep_dists[i] = rep_dists[i - 1]; }
+                    rep_dists[0] = off;
+                }
                 p += len;
             }
         }
@@ -261,6 +283,37 @@ fn lz77_tokenize(input: &[u8]) -> Vec<Token> {
         else { tokens.push(Token::Match { length: len, offset: off }); pos += len; }
     }
     tokens
+}
+
+// ─── Rep codes (LZMA-style distance cache) ──────────────────────────────
+
+fn apply_rep_codes(tokens: Vec<Token>) -> Vec<Token> {
+    let mut rep_dists = [0usize; 4]; // MRU ring buffer of last 4 match distances
+    let mut result = Vec::with_capacity(tokens.len());
+
+    for token in tokens {
+        match token {
+            Token::Match { length, offset } => {
+                // Check if offset matches any cached distance
+                if let Some(idx) = rep_dists.iter().position(|&d| d == offset && d != 0) {
+                    result.push(Token::RepMatch { length, rep_idx: idx as u8 });
+                    // Move to front (MRU order)
+                    if idx > 0 {
+                        let dist = rep_dists[idx];
+                        for i in (1..=idx).rev() { rep_dists[i] = rep_dists[i - 1]; }
+                        rep_dists[0] = dist;
+                    }
+                } else {
+                    result.push(Token::Match { length, offset });
+                    // Shift cache and insert at front
+                    for i in (1..4).rev() { rep_dists[i] = rep_dists[i - 1]; }
+                    rep_dists[0] = offset;
+                }
+            }
+            other => result.push(other),
+        }
+    }
+    result
 }
 
 // ─── Bit I/O ─────────────────────────────────────────────────────────────
@@ -718,7 +771,7 @@ fn init_mtf() -> [u8; 256] {
 
 fn estimate_block_size_mode(tokens: &[Token], mode: LitTransform) -> usize {
     let mut ll_freq = vec![0u32; 286];
-    let mut d_freq = vec![0u32; 40];
+    let mut d_freq = vec![0u32; NUM_DIST_WITH_REP];
     let mut prev_lit = 0u8;
     let mut mtf = init_mtf();
     for t in tokens {
@@ -729,7 +782,11 @@ fn estimate_block_size_mode(tokens: &[Token], mode: LitTransform) -> usize {
             }
             Token::Match { length, offset } => {
                 let (c, _, _) = length_to_code(*length); ll_freq[c as usize] += 1;
-                let (dc, _, _) = offset_to_code(*offset); d_freq[dc as usize] += 1;
+                let (dc, _, _) = offset_to_code(*offset); d_freq[dc as usize + 4] += 1;
+            }
+            Token::RepMatch { length, rep_idx } => {
+                let (c, _, _) = length_to_code(*length); ll_freq[c as usize] += 1;
+                d_freq[*rep_idx as usize] += 1;
             }
         }
     }
@@ -749,7 +806,12 @@ fn estimate_block_size_mode(tokens: &[Token], mode: LitTransform) -> usize {
                 let (lc, leb, _) = length_to_code(*length);
                 bits += ll_lens[lc as usize] as usize + leb as usize;
                 let (dc, deb, _) = offset_to_code(*offset);
-                bits += d_lens[dc as usize] as usize + deb as usize;
+                bits += d_lens[dc as usize + 4] as usize + deb as usize;
+            }
+            Token::RepMatch { length, rep_idx } => {
+                let (lc, leb, _) = length_to_code(*length);
+                bits += ll_lens[lc as usize] as usize + leb as usize;
+                bits += d_lens[*rep_idx as usize] as usize; // rep codes: 0 extra bits
             }
         }
     }
@@ -769,7 +831,7 @@ fn encode_block(tokens: &[Token], out: &mut Vec<u8>) {
     out.push(best_mode_idx as u8);
 
     let mut ll_freq = vec![0u32; 286];
-    let mut d_freq = vec![0u32; 40];
+    let mut d_freq = vec![0u32; NUM_DIST_WITH_REP];
     let mut prev_lit = 0u8;
     let mut mtf = init_mtf();
     for t in tokens {
@@ -780,7 +842,11 @@ fn encode_block(tokens: &[Token], out: &mut Vec<u8>) {
             }
             Token::Match { length, offset } => {
                 let (c, _, _) = length_to_code(*length); ll_freq[c as usize] += 1;
-                let (dc, _, _) = offset_to_code(*offset); d_freq[dc as usize] += 1;
+                let (dc, _, _) = offset_to_code(*offset); d_freq[dc as usize + 4] += 1;
+            }
+            Token::RepMatch { length, rep_idx } => {
+                let (c, _, _) = length_to_code(*length); ll_freq[c as usize] += 1;
+                d_freq[*rep_idx as usize] += 1;
             }
         }
     }
@@ -799,8 +865,9 @@ fn encode_block(tokens: &[Token], out: &mut Vec<u8>) {
         let hi = if ii + 1 < ll_count { ll_lens[ii + 1] & 0x0F } else { 0 };
         out.push(lo | (hi << 4));
     }
+    // d_count can now exceed 40 (up to NUM_DIST_WITH_REP=44), so use u16
     let d_count = d_lens.iter().rposition(|&l| l > 0).map(|p| p + 1).unwrap_or(0);
-    out.push(d_count as u8);
+    out.extend_from_slice(&(d_count as u16).to_le_bytes());
     for ii in (0..d_count).step_by(2) {
         let lo = d_lens[ii] & 0x0F;
         let hi = if ii + 1 < d_count { d_lens[ii + 1] & 0x0F } else { 0 };
@@ -824,9 +891,18 @@ fn encode_block(tokens: &[Token], out: &mut Vec<u8>) {
                 bw.write_bits(rev_bits(code, bits), bits as u32);
                 if leb > 0 { bw.write_bits(lev as u32, leb as u32); }
                 let (dc, deb, dev) = offset_to_code(*offset);
-                let (dcode, dbits) = d_codes[dc as usize];
+                let (dcode, dbits) = d_codes[dc as usize + 4];
                 bw.write_bits(rev_bits(dcode, dbits), dbits as u32);
                 if deb > 0 { bw.write_bits(dev as u32, deb as u32); }
+            }
+            Token::RepMatch { length, rep_idx } => {
+                let (lc, leb, lev) = length_to_code(*length);
+                let (code, bits) = ll_codes[lc as usize];
+                bw.write_bits(rev_bits(code, bits), bits as u32);
+                if leb > 0 { bw.write_bits(lev as u32, leb as u32); }
+                let (dcode, dbits) = d_codes[*rep_idx as usize];
+                bw.write_bits(rev_bits(dcode, dbits), dbits as u32);
+                // No extra bits for rep codes
             }
         }
     }
@@ -850,6 +926,7 @@ fn lz77_compress_with_block_size(tokens: &[Token], orig_size: usize, block_size:
 
 fn lz77_compress(input: &[u8]) -> Vec<u8> {
     let tokens = lz77_tokenize(input);
+    let tokens = apply_rep_codes(tokens);
     // Try multiple block sizes and pick the best
     let block_sizes = [8192, 16384, 32768, 65536];
     let mut best = lz77_compress_with_block_size(&tokens, input.len(), BLOCK_SIZE);
@@ -882,7 +959,7 @@ pub fn compress(input: &[u8]) -> Vec<u8> {
         out.push(1u8); // BWT mode
         out.extend_from_slice(&bwt_result);
     } else {
-        out.push(0u8); // LZ77 mode
+        out.push(2u8); // LZ77 + rep codes mode
         out.extend_from_slice(&lz77_result);
     }
     out
@@ -916,10 +993,10 @@ fn lz77_decompress(input: &[u8]) -> Vec<u8> {
         }
         pos += ll_pk;
 
-        if pos >= input.len() { break; }
-        let d_count = input[pos] as usize; pos += 1;
+        if pos + 2 > input.len() { break; }
+        let d_count = u16::from_le_bytes([input[pos], input[pos + 1]]) as usize; pos += 2;
         if pos + (d_count + 1) / 2 > input.len() { break; }
-        let mut d_lens = vec![0u8; 40];
+        let mut d_lens = vec![0u8; NUM_DIST_WITH_REP];
         let d_pk = (d_count + 1) / 2;
         for ii in 0..d_pk {
             if pos + ii >= input.len() { break; }
@@ -939,6 +1016,7 @@ fn lz77_decompress(input: &[u8]) -> Vec<u8> {
         let mut reader = BitReader::new(&input[pos..pos + bds]); pos += bds;
         let mut prev_lit_dec = 0u8;
         let mut mtf_dec = init_mtf();
+        let mut rep_dists_dec = [0usize; 4];
 
         loop {
             if output.len() >= orig_size { break; }
@@ -963,9 +1041,27 @@ fn lz77_decompress(input: &[u8]) -> Vec<u8> {
                 let extra = if eb > 0 { reader.read_bits(eb as u32) as usize } else { 0 };
                 let length = bl + extra;
                 let dsym = decode_sym(&mut reader, &d_sym, &d_len, d_max);
-                let (bd, deb) = code_to_offset_base(dsym as u8);
-                let dextra = if deb > 0 { reader.read_bits(deb as u32) as usize } else { 0 };
-                let offset = bd + dextra;
+                let dsym_val = dsym as usize;
+                let offset;
+                if dsym_val < 4 {
+                    // Rep code: retrieve from cache
+                    offset = rep_dists_dec[dsym_val];
+                    // Move to front (MRU)
+                    if dsym_val > 0 {
+                        let dist = rep_dists_dec[dsym_val];
+                        for i in (1..=dsym_val).rev() { rep_dists_dec[i] = rep_dists_dec[i - 1]; }
+                        rep_dists_dec[0] = dist;
+                    }
+                } else {
+                    // Normal distance code (shifted by 4)
+                    let real_dcode = (dsym_val - 4) as u8;
+                    let (bd, deb) = code_to_offset_base(real_dcode);
+                    let dextra = if deb > 0 { reader.read_bits(deb as u32) as usize } else { 0 };
+                    offset = bd + dextra;
+                    // Push into rep cache (MRU)
+                    for i in (1..4).rev() { rep_dists_dec[i] = rep_dists_dec[i - 1]; }
+                    rep_dists_dec[0] = offset;
+                }
                 if offset == 0 || offset > output.len() { break; }
                 let start = output.len() - offset;
                 for j in 0..length { let b = output[start + j]; output.push(b); }
@@ -981,7 +1077,8 @@ pub fn decompress(input: &[u8]) -> Vec<u8> {
     let data = &input[1..];
     match mode {
         1 => bwt_decompress(data),
-        _ => lz77_decompress(data),
+        2 => lz77_decompress(data),
+        _ => lz77_decompress(data), // backward compat
     }
 }
 
