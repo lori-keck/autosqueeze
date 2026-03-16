@@ -13,7 +13,7 @@ use std::io::{self, Read, Write};
 
 const WINDOW_SIZE: usize = 1048576; // 1MB window
 const MIN_MATCH: usize = 3;
-const MAX_MATCH: usize = 258;
+const MAX_MATCH: usize = 65535;
 const HASH_CHAIN_LIMIT: usize = 512;
 const BLOCK_SIZE: usize = 32768;
 
@@ -43,9 +43,8 @@ fn length_to_code(length: usize) -> (u16, u8, u16) {
         131..=162 => (281, 5, (length - 131) as u16),
         163..=194 => (282, 5, (length - 163) as u16),
         195..=226 => (283, 5, (length - 195) as u16),
-        227..=257 => (284, 5, (length - 227) as u16),
-        258 => (285, 0, 0),
-        _ => (285, 0, 0),
+        227..=258 => (284, 5, (length - 227) as u16),
+        _ => (285, 16, (length - 259) as u16), // long match escape: 259..=65535
     }
 }
 
@@ -58,7 +57,7 @@ fn code_to_length_base(code: u16) -> (usize, u8) {
         273 => (35, 3), 274 => (43, 3), 275 => (51, 3), 276 => (59, 3),
         277 => (67, 4), 278 => (83, 4), 279 => (99, 4), 280 => (115, 4),
         281 => (131, 5), 282 => (163, 5), 283 => (195, 5), 284 => (227, 5),
-        285 => (258, 0),
+        285 => (259, 16), // long match escape: base 259, 16 extra bits
         _ => (0, 0),
     }
 }
@@ -223,7 +222,8 @@ fn lz77_tokenize(input: &[u8]) -> Vec<Token> {
                 let dl_c = if dl == 0 { 15 } else { dl as u32 };
                 let mc = ll_c + leb as u32 + dl_c + deb as u32 + cost[pos + len];
                 if mc < cost[pos] { cost[pos] = mc; choice[pos] = (len, off); }
-                for &sl in &[3,4,5,6,7,8,9,10,11,13,15,17,19,23,27,31,35,43,51,67,83,99,115,131] {
+                // Try sub-lengths at DEFLATE code boundaries
+                for &sl in &[3,4,5,6,7,8,9,10,11,13,15,17,19,23,27,31,35,43,51,67,83,99,115,131,163,195,227,258] {
                     if sl >= MIN_MATCH && sl < len {
                         let (slc, sleb, _) = length_to_code(sl);
                         let sll = ll_lens[slc as usize];
