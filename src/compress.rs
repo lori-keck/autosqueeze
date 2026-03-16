@@ -634,7 +634,8 @@ impl<'a> RcDecoder<'a> {
 ///
 /// Uses 12-bit fixed-point probability with exponential smoothing for fast adaptation.
 
-const BWTRC_NUM_CTX: usize = 256; // context buckets
+const BWTRC_NUM_CTX: usize = 256; // context buckets for primary model
+const BWTRC_NUM_CTX2: usize = 256; // secondary model: previous decoded byte
 
 struct BwtBitModel {
     // Probability of bit=1, stored as 12-bit fixed point (0..4096)
@@ -653,9 +654,110 @@ impl BwtBitModel {
         }
     }
 
+    fn new_with_size(num_ctx: usize) -> Self {
+        BwtBitModel {
+            prob: vec![Self::PROB_HALF; num_ctx * 256],
+        }
+    }
+
     #[inline(always)]
     fn idx(ctx: usize, tree_node: usize) -> usize {
         ctx * 256 + tree_node
+    }
+    
+    /// Encode a byte using blended prediction from two models
+    fn encode_byte_dual(m1: &mut BwtBitModel, m2: &mut BwtBitModel, enc: &mut RcEncoder,
+                        ctx1: usize, ctx2: usize, byte: u8) {
+        let mut node = 1usize;
+        for bit_pos in (0..8).rev() {
+            let bit = ((byte >> bit_pos) & 1) as u32;
+            let i1 = Self::idx(ctx1, node);
+            let i2 = Self::idx(ctx2, node);
+            let p1_a = m1.prob[i1] as u32;
+            let p1_b = m2.prob[i2] as u32;
+            
+            // Blend: weighted average (50/50 for now)
+            let p1_blended = (p1_a + p1_b) / 2;
+
+            let bound = enc.low.wrapping_add(
+                (enc.range >> Self::PROB_BITS).wrapping_mul(Self::PROB_MAX - p1_blended)
+            );
+
+            if bit == 0 {
+                enc.range = bound.wrapping_sub(enc.low);
+            } else {
+                enc.range = enc.range - (bound.wrapping_sub(enc.low));
+                enc.low = bound;
+            }
+
+            while (enc.low ^ enc.low.wrapping_add(enc.range)) < RC_TOP || enc.range < RC_BOT {
+                if (enc.low ^ enc.low.wrapping_add(enc.range)) >= RC_TOP {
+                    enc.range = enc.low.wrapping_neg() & (RC_BOT - 1);
+                }
+                enc.buf.push((enc.low >> 24) as u8);
+                enc.low <<= 8;
+                enc.range <<= 8;
+            }
+
+            // Update both models independently
+            if bit == 1 {
+                m1.prob[i1] += ((Self::PROB_MAX - p1_a) >> Self::ADAPT_SHIFT) as u16;
+                m2.prob[i2] += ((Self::PROB_MAX - p1_b) >> Self::ADAPT_SHIFT) as u16;
+            } else {
+                m1.prob[i1] -= (p1_a >> Self::ADAPT_SHIFT) as u16;
+                m2.prob[i2] -= (p1_b >> Self::ADAPT_SHIFT) as u16;
+            }
+
+            node = node * 2 + bit as usize;
+        }
+    }
+
+    fn decode_byte_dual(m1: &mut BwtBitModel, m2: &mut BwtBitModel, dec: &mut RcDecoder,
+                        ctx1: usize, ctx2: usize) -> u8 {
+        let mut node = 1usize;
+        let mut byte = 0u8;
+        for bit_pos in (0..8).rev() {
+            let i1 = Self::idx(ctx1, node);
+            let i2 = Self::idx(ctx2, node);
+            let p1_a = m1.prob[i1] as u32;
+            let p1_b = m2.prob[i2] as u32;
+            let p1_blended = (p1_a + p1_b) / 2;
+
+            let bound = dec.low.wrapping_add(
+                (dec.range >> Self::PROB_BITS).wrapping_mul(Self::PROB_MAX - p1_blended)
+            );
+
+            let bit;
+            if dec.code < bound {
+                bit = 0u32;
+                dec.range = bound.wrapping_sub(dec.low);
+            } else {
+                bit = 1;
+                dec.range = dec.range - (bound.wrapping_sub(dec.low));
+                dec.low = bound;
+            }
+
+            while (dec.low ^ dec.low.wrapping_add(dec.range)) < RC_TOP || dec.range < RC_BOT {
+                if (dec.low ^ dec.low.wrapping_add(dec.range)) >= RC_TOP {
+                    dec.range = dec.low.wrapping_neg() & (RC_BOT - 1);
+                }
+                dec.code = (dec.code << 8) | dec.byte() as u32;
+                dec.low <<= 8;
+                dec.range <<= 8;
+            }
+
+            if bit == 1 {
+                m1.prob[i1] += ((Self::PROB_MAX - p1_a) >> Self::ADAPT_SHIFT) as u16;
+                m2.prob[i2] += ((Self::PROB_MAX - p1_b) >> Self::ADAPT_SHIFT) as u16;
+            } else {
+                m1.prob[i1] -= (p1_a >> Self::ADAPT_SHIFT) as u16;
+                m2.prob[i2] -= (p1_b >> Self::ADAPT_SHIFT) as u16;
+            }
+
+            byte |= (bit as u8) << bit_pos;
+            node = node * 2 + bit as usize;
+        }
+        byte
     }
 
     /// Adaptation rate: shift by 3 = divide by 8 = ~12.5% adaptation per sample
@@ -846,12 +948,16 @@ fn bwt_compress(input: &[u8]) -> Vec<u8> {
             out.push((c >> 16) as u8);
         }
         
-        // Bitwise range coding with F-column context (no MTF/RLE)
-        let mut model = BwtBitModel::new();
+        // Dual-model bitwise range coding: blend F-column model + previous-byte model
+        let mut model1 = BwtBitModel::new(); // F-column context
+        let mut model2 = BwtBitModel::new_with_size(BWTRC_NUM_CTX2); // prev-byte context
         let mut enc = RcEncoder::new();
         
+        let mut prev: u8 = 0;
         for i in 0..bwt_data.len() {
-            model.encode_byte(&mut enc, f_col[i] as usize, bwt_data[i]);
+            BwtBitModel::encode_byte_dual(&mut model1, &mut model2, &mut enc,
+                f_col[i] as usize, prev as usize, bwt_data[i]);
+            prev = bwt_data[i];
         }
         
         let encoded = enc.finish();
@@ -888,14 +994,18 @@ fn bwt_decompress(input: &[u8]) -> Vec<u8> {
         let enc_size = u32::from_le_bytes([input[pos], input[pos+1], input[pos+2], input[pos+3]]) as usize; pos += 4;
         if pos + enc_size > input.len() { break; }
         
-        let mut model = BwtBitModel::new();
+        let mut model1 = BwtBitModel::new();
+        let mut model2 = BwtBitModel::new_with_size(BWTRC_NUM_CTX2);
         let mut dec = RcDecoder::new(&input[pos..pos+enc_size]); pos += enc_size;
         
         let mut bwt_data = Vec::with_capacity(block_len);
+        let mut prev: u8 = 0;
         
         for i in 0..block_len {
-            let b = model.decode_byte(&mut dec, f_col[i] as usize);
+            let b = BwtBitModel::decode_byte_dual(&mut model1, &mut model2, &mut dec,
+                f_col[i] as usize, prev as usize);
             bwt_data.push(b);
+            prev = b;
         }
         
         let original = bwt_inverse(&bwt_data, orig_idx);
